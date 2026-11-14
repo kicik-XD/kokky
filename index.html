@@ -69,7 +69,7 @@
               <span class="menu__check" id="motionCheck" aria-hidden="true">✓</span>
             </button>
             <button class="menu__item" type="button" role="menuitem" data-action="clear-likes">Очистить избранное</button>
-            <p class="menu__note">аудио: YouTube · без аккаунта</p>
+            <p class="menu__note">аудио: SoundCloud · без аккаунта</p>
           </div>
         </div>
       </div>
@@ -98,10 +98,10 @@
           </button>
 
           <div class="menu menu--top" id="topMenu" role="menu">
-            <a class="menu__item" role="menuitem" href="https://www.youtube.com" target="_blank" rel="noopener">Открыть YouTube</a>
+            <a class="menu__item" role="menuitem" href="https://soundcloud.com" target="_blank" rel="noopener">Открыть SoundCloud</a>
             <button class="menu__item" type="button" role="menuitem" data-action="shortcuts">Горячие клавиши</button>
             <button class="menu__item" type="button" role="menuitem" data-action="about">О kokky</button>
-            <p class="menu__note">полные треки · YouTube</p>
+            <p class="menu__note">полные треки · SoundCloud</p>
           </div>
         </div>
       </header>
@@ -115,14 +115,21 @@
             <span class="art__halo" aria-hidden="true"></span>
             <img class="art__img" id="coverImage" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 480 480'%3E%3Crect width='480' height='480' fill='%230d0d0d'/%3E%3Cpath d='M240 152 336 328H144Z' fill='%23262626'/%3E%3C/svg%3E" alt="Обложка трека">
             <div class="art__frame" id="artFrame">
-              <div id="ytPlayer"></div>
+              <iframe
+                id="scPlayer"
+                class="sc-player"
+                title="SoundCloud"
+                allow="autoplay"
+                frameborder="0"
+                scrolling="no"
+              ></iframe>
             </div>
             <div class="art__notice" id="artNotice" hidden>
               <span class="art__notice-mark" aria-hidden="true">
                 <svg viewBox="0 0 24 24"><path d="M12 3.2 21.6 20.4H2.4L12 3.2Z" fill="currentColor"/></svg>
               </span>
               <strong class="art__notice-title">нужен локальный сервер</strong>
-              <span class="art__notice-text">YouTube не играет со страницы <code>file://</code></span>
+              <span class="art__notice-text">SoundCloud не играет со страницы <code>file://</code></span>
               <button class="ghost-pill" id="serverHelpBtn" type="button">Как запустить</button>
             </div>
           </div>
@@ -181,7 +188,7 @@
                 </button>
 
                 <div class="menu menu--track" id="trackMenu" role="menu">
-                  <a class="menu__item" id="trackSourceLink" role="menuitem" href="https://www.youtube.com" target="_blank" rel="noopener">Слушать на YouTube</a>
+                  <a class="menu__item" id="trackSourceLink" role="menuitem" href="https://soundcloud.com" target="_blank" rel="noopener">Слушать на SoundCloud</a>
                   <button class="menu__item" type="button" role="menuitem" data-action="add-to-playlist">Добавить в плейлист</button>
                   <button class="menu__item" type="button" role="menuitem" data-action="copy-link">Скопировать ссылку</button>
                 </div>
@@ -249,7 +256,7 @@
           <header class="page__head">
             <p class="eyebrow">Плейлисты</p>
             <h2 class="page__title">плейлисты.</h2>
-            <p class="page__sub">свои плейлисты · полные треки YouTube</p>
+            <p class="page__sub">свои плейлисты · полные треки SoundCloud</p>
           </header>
           <div class="playlists" id="playlists"></div>
         </div>

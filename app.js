@@ -6,22 +6,25 @@
 
   const FILE_MODE = window.location.protocol === "file:";
 
-  const PIPED =
-    Array.isArray(library.piped) && library.piped.length
-      ? library.piped
-      : ["https://api.piped.private.coffee", "https://pipedapi.ducks.party"];
+  const SC_CONFIG = {
+    api: "https://api-v2.soundcloud.com",
+    clientId:
+      (library.soundcloud && library.soundcloud.clientId) ||
+      "qLcgHhXgeEFFaSolTB9I71LBsqncsD93",
+    proxy: (library.soundcloud && library.soundcloud.proxy) || "",
+  };
 
   const FEED_QUERIES =
     Array.isArray(library.feedQueries) && library.feedQueries.length
       ? library.feedQueries
-      : ["pop music", "hip hop music", "rock music", "r&b music", "indie music"];
+      : ["pop hits", "hip hop", "r&b", "electronic", "indie", "chill"];
 
   const STORE = {
-    liked: "kokky:liked:yt",
+    liked: "kokky:liked:sc",
     volume: "kokky:volume",
     motion: "kokky:motion",
-    playlists: "kokky:playlists:yt",
-    feed: "kokky:feed:yt",
+    playlists: "kokky:playlists:sc",
+    feed: "kokky:feed:sc",
   };
 
   const FALLBACK_COVER = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(
@@ -62,33 +65,56 @@
     });
 
   const cleanArtist = (name) =>
-    decodeEntities(name || "YouTube")
-      .replace(/\s*-\s*Topic$/i, "")
+    decodeEntities(name || "SoundCloud")
       .replace(/\s+/g, " ")
-      .trim() || "YouTube";
+      .trim() || "SoundCloud";
 
-  const videoIdFrom = (url) => {
-    const match = String(url || "").match(/[?&]v=([\w-]{11})/);
-    if (match) return match[1];
-    const tail = String(url || "").split("/").pop() || "";
-    return /^[\w-]{11}$/.test(tail) ? tail : "";
+  // Обложки SoundCloud бывают 100px и 500px — просим большую.
+  const coverFor = (url) => {
+    const source = String(url || "");
+    if (!source) return FALLBACK_COVER;
+    return source
+      .replace("-large.", "-t500x500.")
+      .replace("-crop.", "-t500x500.")
+      .replace("/large/", "/t500x500/");
   };
 
-  const coverFor = (id) => `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
+  // SNIP — это 30-секундный отрывок, такие треки не берём.
+  const isStreamable = (item) =>
+    !!item &&
+    item.kind === "track" &&
+    item.streamable !== false &&
+    item.policy !== "SNIP" &&
+    item.policy !== "BLOCK" &&
+    item.access !== "blocked" &&
+    item.embeddable_by !== "none";
 
-  const fromPiped = (item) => {
-    if (!item || item.type === "channel" || item.type === "playlist") return null;
-    const id = videoIdFrom(item.url) || (item.id && /^[\w-]{11}$/.test(item.id) ? item.id : "");
-    if (!id) return null;
+  const isTalky = (title) =>
+    /\b(podcast|podcast episode|episode|interview|audiobook|dj set|live set)\b/i.test(
+      String(title || "")
+    );
+
+  const fromSoundCloud = (item) => {
+    if (!isStreamable(item)) return null;
+    const id = item.id == null ? "" : String(item.id);
+    if (!/^\d+$/.test(id)) return null;
+
+    const title = decodeEntities(item.title || "без названия").trim() || "без названия";
+    if (isTalky(title)) return null;
+
+    const duration = Math.max(0, Math.round((Number(item.duration) || 0) / 1000));
+    if (duration && (duration < 45 || duration > 1200)) return null;
+    // Длинные диджей-миксы — не «треки», в поток их не берём.
+    if (duration > 600 && /\bmix\b/i.test(title)) return null;
+
     return {
       id,
-      videoId: id,
-      title: decodeEntities(item.title || "без названия").trim() || "без названия",
-      artist: cleanArtist(item.uploaderName),
-      duration: Math.max(0, Math.round(Number(item.duration) || 0)),
-      cover: coverFor(id),
-      permalink: `https://www.youtube.com/watch?v=${id}`,
-      genre: "",
+      title,
+      artist: cleanArtist(item.user && item.user.username),
+      duration,
+      cover: coverFor(item.artwork_url || (item.user && item.user.avatar_url)),
+      permalink: item.permalink_url || "https://soundcloud.com",
+      genre: item.genre || "",
       album: null,
     };
   };
@@ -105,121 +131,55 @@
   const isCachedTrack = (track) =>
     !!track &&
     typeof track.id === "string" &&
-    /^[\w-]{11}$/.test(track.id) &&
+    /^\d+$/.test(track.id) &&
     typeof track.title === "string";
 
   /* =========================================================
-     YouTube search (Piped or official Data API)
+     SoundCloud search
      ========================================================= */
 
+  function proxyUrl(url) {
+    if (SC_CONFIG.proxy) return `${SC_CONFIG.proxy}${encodeURIComponent(url)}`;
+    // r.jina.ai — публичный reader без ключа. Он отдаёт CORS и пропускает
+    // ответ SoundCloud как текст, из которого мы вырезаем JSON.
+    return `https://r.jina.ai/${url}`;
+  }
+
   async function requestJson(url, signal) {
-    const response = await fetch(url, { signal, headers: { Accept: "application/json" } });
+    const response = await fetch(proxyUrl(url), {
+      signal,
+      headers: { Accept: "application/json, text/plain, */*" },
+    });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return response.json();
+
+    const text = await response.text();
+    const start = text.indexOf("{");
+    if (start < 0) throw new Error("bad payload");
+    return JSON.parse(text.slice(start));
   }
 
-  async function pipedJson(path, signal) {
-    let lastError = null;
-
-    for (const base of PIPED) {
-      try {
-        const json = await requestJson(`${base}${path}`, signal);
-        if (!json || typeof json !== "object") throw new Error("bad payload");
-        return json;
-      } catch (error) {
-        if (error && error.name === "AbortError") throw error;
-        lastError = error;
-      }
-    }
-
-    throw lastError || new Error("piped unavailable");
+  function scUrl(path, params) {
+    const query = new URLSearchParams({ ...params, client_id: SC_CONFIG.clientId });
+    return `${SC_CONFIG.api}${path}?${query.toString()}`;
   }
 
-  async function searchPiped(query, limit = 24, signal, maxSeconds = 5400) {
-    const json = await pipedJson(
-      `/search?q=${encodeURIComponent(query)}&filter=music_songs`,
-      signal
-    );
-    const items = Array.isArray(json.items) ? json.items : [];
-
-    const tracks = items
-      .map(fromPiped)
-      .filter(Boolean)
-      .filter(
-        (track) =>
-          track.duration === 0 || (track.duration >= 30 && track.duration <= maxSeconds)
-      );
-
-    return dedupe(tracks).slice(0, limit);
-  }
-
-  function parseISODuration(value) {
-    const match = String(value || "").match(
-      /^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/
-    );
-    if (!match) return 0;
-    return (
-      (Number(match[1]) || 0) * 86400 +
-      (Number(match[2]) || 0) * 3600 +
-      (Number(match[3]) || 0) * 60 +
-      (Number(match[4]) || 0)
-    );
-  }
-
-  async function searchOfficial(query, limit = 24, signal) {
-    const key = library.youtube?.apiKey;
-    const base = "https://www.googleapis.com/youtube/v3";
-    const max = Math.min(25, Math.max(1, limit));
-
-    const found = await requestJson(
-      `${base}/search?part=snippet&type=video&videoCategoryId=10&maxResults=${max}` +
-        `&q=${encodeURIComponent(query)}&key=${encodeURIComponent(key)}`,
+  async function searchSoundCloud(query, limit = 24, signal) {
+    const json = await requestJson(
+      scUrl("/search/tracks", {
+        q: query,
+        limit: String(Math.min(50, Math.max(1, limit))),
+        linked_partitioning: "1",
+      }),
       signal
     );
 
-    const items = Array.isArray(found.items) ? found.items : [];
-    const ids = items.map((item) => item.id?.videoId).filter(Boolean);
-    if (!ids.length) return [];
+    const items = Array.isArray(json.collection) ? json.collection : [];
+    // Сначала популярные: так в потоке меньше случайных загрузок.
+    const sorted = [...items].sort(
+      (a, b) => (Number(b.playback_count) || 0) - (Number(a.playback_count) || 0)
+    );
 
-    let durations = new Map();
-    try {
-      const details = await requestJson(
-        `${base}/videos?part=contentDetails&id=${ids.join(",")}` +
-          `&key=${encodeURIComponent(key)}`,
-        signal
-      );
-      durations = new Map(
-        (details.items || []).map((item) => [
-          item.id,
-          parseISODuration(item.contentDetails?.duration),
-        ])
-      );
-    } catch (_) {
-      /* длительности необязательны — плеер уточнит их сам */
-    }
-
-    return items
-      .map((item) => {
-        const id = item.id?.videoId;
-        if (!id) return null;
-        return {
-          id,
-          videoId: id,
-          title: decodeEntities(item.snippet?.title || "без названия").trim(),
-          artist: cleanArtist(item.snippet?.channelTitle),
-          duration: durations.get(id) || 0,
-          cover: coverFor(id),
-          permalink: `https://www.youtube.com/watch?v=${id}`,
-          genre: "",
-          album: null,
-        };
-      })
-      .filter(Boolean);
-  }
-
-  function fetchYouTubeTracks(query, limit = 24, signal) {
-    if (library.youtube?.apiKey) return searchOfficial(query, limit, signal);
-    return searchPiped(query, limit, signal);
+    return dedupe(sorted.map(fromSoundCloud).filter(Boolean)).slice(0, limit);
   }
 
   function readFeedCache() {
@@ -248,7 +208,9 @@
 
   async function fetchFeed() {
     const settled = await Promise.allSettled(
-      FEED_QUERIES.map((query) => searchPiped(query, 20, undefined, 900))
+      FEED_QUERIES.map((query) =>
+        searchSoundCloud(query, 20, AbortSignal.timeout(20000))
+      )
     );
 
     const lists = settled
@@ -291,6 +253,7 @@
     muted: false,
     closed: false,
     playing: false,
+    started: false,
   };
 
   try {
@@ -330,6 +293,7 @@
     stage: $("#stage"),
     art: $(".art"),
     artNotice: $("#artNotice"),
+    scPlayer: $("#scPlayer"),
     serverHelpBtn: $("#serverHelpBtn"),
     playerView: $("#view-stream"),
     views: {
@@ -499,7 +463,7 @@
     }
 
     if (action === "about") {
-      toast("kokky · полные треки с YouTube · без аккаунта");
+      toast("kokky · полные треки с SoundCloud · без аккаунта");
     }
 
     if (action === "add-to-playlist") {
@@ -669,11 +633,9 @@
   function applyVolume(persist = false) {
     const percent = Math.round(state.volume * 100);
 
-    if (ytReady) {
+    if (scReady && scWidget) {
       try {
-        ytPlayer.setVolume(percent);
-        if (state.muted || state.volume === 0) ytPlayer.mute();
-        else ytPlayer.unMute();
+        scWidget.setVolume(state.muted || state.volume === 0 ? 0 : percent);
       } catch (_) {
         /* player is not ready yet */
       }
@@ -716,73 +678,77 @@
   });
 
   /* =========================================================
-     YouTube player
+     SoundCloud player
      ========================================================= */
 
-  let ytPlayer = null;
-  let ytReady = false;
+  let scWidget = null;
+  let scReady = false;
+  let scDuration = 0;
+  let scPosition = 0;
   let pendingCue = null;
   let errorStreak = 0;
-
-  const PLAYER_STATE = {
-    UNSTARTED: -1,
-    ENDED: 0,
-    PLAYING: 1,
-    PAUSED: 2,
-    BUFFERING: 3,
-    CUED: 5,
-  };
+  let widgetApiPromise = null;
 
   function getDuration() {
-    if (ytReady) {
-      try {
-        const live = Number(ytPlayer.getDuration());
-        if (Number.isFinite(live) && live > 0) return live;
-      } catch (_) {
-        /* ignore */
-      }
-    }
+    if (Number.isFinite(scDuration) && scDuration > 0) return scDuration;
     return state.current?.duration || 0;
   }
 
   function getCurrentTime() {
-    if (!ytReady) return 0;
-    try {
-      return Number(ytPlayer.getCurrentTime()) || 0;
-    } catch (_) {
-      return 0;
-    }
+    return scPosition;
   }
 
-  function playerState() {
-    if (!ytReady) return PLAYER_STATE.UNSTARTED;
-    try {
-      return ytPlayer.getPlayerState();
-    } catch (_) {
-      return PLAYER_STATE.UNSTARTED;
-    }
+  function setPosition(ms) {
+    const value = Number(ms);
+    if (!Number.isFinite(value)) return;
+    scPosition = Math.max(0, value / 1000);
+    updateProgress();
   }
 
   function cueTrack(track, { autoplay = false } = {}) {
     if (FILE_MODE) return;
 
-    if (!ytReady || !track) {
-      pendingCue = { autoplay };
+    if (!scWidget || !scReady || !track) {
+      pendingCue = { track, autoplay };
       return;
     }
 
-    const id = track.videoId || track.id;
-    if (!/^[\w-]{11}$/.test(id)) {
-      toast("у этого трека нет видео YouTube · включите другой");
+    if (!/^\d+$/.test(String(track.id || ""))) {
+      toast("этот трек нельзя включить · выберите другой");
       return;
     }
 
     pendingCue = null;
-    dom.art.classList.add("has-player");
+    state.started = true;
+    scDuration = track.duration || 0;
+    scPosition = 0;
+    resetProgressUI();
 
     try {
-      if (autoplay) ytPlayer.loadVideoById(id);
-      else ytPlayer.cueVideoById(id);
+      scWidget.load(`https://api.soundcloud.com/tracks/${track.id}`, {
+        auto_play: !!autoplay,
+        hide_related: true,
+        show_comments: false,
+        show_user: false,
+        show_reposts: false,
+        show_artwork: false,
+        visual: false,
+        download: false,
+        sharing: false,
+        callback: () => {
+          try {
+            scWidget.getDuration((ms) => {
+              if (Number(ms) > 0) {
+                scDuration = Number(ms) / 1000;
+                resetProgressUI();
+              }
+            });
+            if (autoplay) scWidget.play();
+          } catch (_) {
+            /* ignore */
+          }
+        },
+      });
     } catch (_) {
       toast("не удалось включить трек · попробуйте ещё раз");
     }
@@ -803,22 +769,22 @@
     }
 
     if (!state.current) return;
-    if (!ytReady) {
-      pendingCue = { autoplay: true };
+    if (!scWidget || !scReady) {
+      pendingCue = { track: state.current, autoplay: true };
       return;
     }
 
     try {
-      ytPlayer.playVideo();
+      scWidget.play();
     } catch (_) {
       if (!silent) toast("не удалось включить трек · проверьте соединение");
     }
   }
 
   function pauseAudio() {
-    if (!ytReady) return;
+    if (!scReady || !scWidget) return;
     try {
-      ytPlayer.pauseVideo();
+      scWidget.pause();
     } catch (_) {
       /* ignore */
     }
@@ -831,16 +797,16 @@
     }
 
     if (!state.current) return;
-    const status = playerState();
 
-    if (status === PLAYER_STATE.PLAYING || status === PLAYER_STATE.BUFFERING) {
+    if (state.playing) {
       pauseAudio();
+      return;
+    }
+
+    if (!scWidget || !scReady || !scDuration) {
+      cueTrack(state.current, { autoplay: true });
     } else {
-      if (!ytReady || status === PLAYER_STATE.CUED || status === PLAYER_STATE.UNSTARTED) {
-        cueTrack(state.current, { autoplay: true });
-      } else {
-        playAudio();
-      }
+      playAudio();
     }
   }
 
@@ -938,9 +904,11 @@
      ========================================================= */
 
   function seekTo(seconds) {
-    if (!ytReady) return;
+    if (!scReady || !scWidget) return;
+    const value = Math.max(0, seconds);
     try {
-      ytPlayer.seekTo(Math.max(0, seconds), true);
+      scWidget.seekTo(value * 1000);
+      scPosition = value;
     } catch (_) {
       /* ignore */
     }
@@ -1007,68 +975,54 @@
   });
 
   /* =========================================================
-     YouTube player lifecycle
+     SoundCloud widget lifecycle
      ========================================================= */
 
   function handlePlayerReady() {
-    ytReady = true;
+    scReady = true;
     applyVolume();
 
-    if (state.current) {
-      cueTrack(state.current, { autoplay: !!pendingCue?.autoplay });
+    const cue = pendingCue;
+    pendingCue = null;
+
+    if (cue && cue.track) {
+      cueTrack(cue.track, { autoplay: !!cue.autoplay });
     }
   }
 
-  function handlePlayerState(event) {
-    const status = event.data;
+  function handlePlay() {
+    errorStreak = 0;
+    state.playing = true;
+    syncPlayState();
+    startTicker();
+    updateProgress();
+  }
 
-    if (status === PLAYER_STATE.PLAYING) {
-      errorStreak = 0;
-      state.playing = true;
-      syncPlayState();
-      startTicker();
-      updateProgress();
-      return;
-    }
+  function handlePause() {
+    state.playing = false;
+    syncPlayState();
+    stopTicker();
+  }
 
-    if (status === PLAYER_STATE.PAUSED) {
-      state.playing = false;
-      syncPlayState();
-      stopTicker();
-      return;
-    }
+  function handleFinish() {
+    state.playing = false;
+    syncPlayState();
+    stopTicker();
 
-    if (status === PLAYER_STATE.ENDED) {
-      state.playing = false;
-      syncPlayState();
-      stopTicker();
-      if (state.queue.length > 1) {
-        state.index = (state.index + 1) % state.queue.length;
-        loadTrack(state.queue[state.index], { autoplay: true });
-      } else {
-        seekTo(0);
-        updateProgress();
-      }
-      return;
-    }
-
-    if (status === PLAYER_STATE.CUED || status === PLAYER_STATE.UNSTARTED) {
+    if (state.queue.length > 1) {
+      state.index = (state.index + 1) % state.queue.length;
+      loadTrack(state.queue[state.index], { autoplay: true });
+    } else {
+      seekTo(0);
       updateProgress();
     }
   }
 
-  function handlePlayerError(event) {
-    const code = Number(event?.data);
+  function handlePlayerError() {
     state.playing = false;
     syncPlayState();
 
-    if (code === 150 || code === 101) {
-      toast("видео запрещено встраивать · включаем следующий");
-    } else if (code === 100 || code === 2) {
-      toast("трек недоступен · включаем следующий");
-    } else {
-      toast("не удалось включить трек · проверьте соединение");
-    }
+    toast("трек недоступен · включаем следующий");
 
     errorStreak += 1;
     if (errorStreak > 5) {
@@ -1082,53 +1036,70 @@
     }
   }
 
-  function createPlayer() {
-    if (ytPlayer) return;
+  function loadWidgetApi() {
+    if (window.SC && window.SC.Widget) return Promise.resolve();
+    if (widgetApiPromise) return widgetApiPromise;
 
-    const vars = {
-      autoplay: 0,
-      controls: 0,
-      disablekb: 1,
-      modestbranding: 1,
-      rel: 0,
-      playsinline: 1,
-      fs: 0,
-      iv_load_policy: 3,
-    };
-
-    if (window.location.protocol === "http:" || window.location.protocol === "https:") {
-      vars.origin = window.location.origin;
-    }
-
-    ytPlayer = new window.YT.Player("ytPlayer", {
-      width: "100%",
-      height: "100%",
-      playerVars: vars,
-      events: {
-        onReady: handlePlayerReady,
-        onStateChange: handlePlayerState,
-        onError: handlePlayerError,
-      },
+    widgetApiPromise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "https://w.soundcloud.com/player/api.js";
+      script.async = true;
+      script.addEventListener("load", () => resolve());
+      script.addEventListener("error", () => reject(new Error("widget api")));
+      document.head.appendChild(script);
     });
+
+    return widgetApiPromise;
   }
 
-  function loadYouTubeApi() {
-    if (FILE_MODE) return;
+  async function waitForWidgetApi(timeout = 5000) {
+    const started = Date.now();
+    while (
+      (!window.SC || typeof window.SC.Widget !== "function") &&
+      Date.now() - started < timeout
+    ) {
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+    }
+    return !!window.SC && typeof window.SC.Widget === "function";
+  }
 
-    if (window.YT && window.YT.Player) {
-      createPlayer();
+  async function createPlayer() {
+    if (FILE_MODE || scWidget) return;
+
+    try {
+      await loadWidgetApi();
+    } catch (_) {
+      toast("не удалось загрузить плеер SoundCloud · проверьте соединение");
       return;
     }
 
-    window.onYouTubeIframeAPIReady = createPlayer;
+    if (!(await waitForWidgetApi())) {
+      toast("не удалось загрузить плеер SoundCloud · проверьте соединение");
+      return;
+    }
 
-    const script = document.createElement("script");
-    script.src = "https://www.youtube.com/iframe_api";
-    script.async = true;
-    script.addEventListener("error", () => {
-      toast("YouTube недоступен · проверьте соединение");
-    });
-    document.head.appendChild(script);
+    if (!dom.scPlayer) return;
+
+    dom.scPlayer.src =
+      "https://w.soundcloud.com/player/?url=&auto_play=false&hide_related=true" +
+      "&show_comments=false&show_user=false&show_reposts=false&visual=false";
+
+    try {
+      scWidget = window.SC.Widget(dom.scPlayer);
+      scWidget.bind(window.SC.Widget.Events.READY, handlePlayerReady);
+      scWidget.bind(window.SC.Widget.Events.PLAY, handlePlay);
+      scWidget.bind(window.SC.Widget.Events.PAUSE, handlePause);
+      scWidget.bind(window.SC.Widget.Events.FINISH, handleFinish);
+      scWidget.bind(window.SC.Widget.Events.ERROR, handlePlayerError);
+      scWidget.bind(window.SC.Widget.Events.PLAY_PROGRESS, (event) => {
+        if (event && typeof event.currentPosition === "number") {
+          setPosition(event.currentPosition);
+        }
+      });
+    } catch (_) {
+      scWidget = null;
+      toast("не удалось загрузить плеер SoundCloud · проверьте соединение");
+    }
   }
 
   /* =========================================================
@@ -1237,7 +1208,7 @@
       const controller = new AbortController();
       searchController = controller;
       try {
-        const remote = await fetchYouTubeTracks(query, 30, controller.signal);
+        const remote = await searchSoundCloud(query, 30, controller.signal);
         if (token !== searchToken || dom.searchInput.value.trim() !== query) return;
 
         const merged = dedupe([...local, ...remote]);
@@ -1261,17 +1232,17 @@
     if (!normalized) {
       cancelSearch();
       if (feed.length) {
-        paintResults(feed, `тренды YouTube · ${feed.length}`);
+        paintResults(feed, `тренды SoundCloud · ${feed.length}`);
       } else {
         paintNotice(
-          feedError ? "не удалось загрузить тренды · попробуйте поиск" : "загружаем тренды YouTube…"
+          feedError ? "не удалось загрузить тренды · попробуйте поиск" : "загружаем тренды SoundCloud…"
         );
       }
       return;
     }
 
     const local = filterTracks(normalized);
-    paintResults(local, local.length ? `найдено · ${local.length}` : "ищем на YouTube…");
+    paintResults(local, local.length ? `найдено · ${local.length}` : "ищем на SoundCloud…");
     scheduleSearch(normalized, local);
   }
 
@@ -1372,7 +1343,7 @@
       el(
         "p",
         "dialog__hint",
-        "YouTube запрещает встроенный плеер на страницах file://. Запустите kokky через локальный сервер — и всё заработает."
+        "Браузер не даёт плееру SoundCloud работать со страницы file://. Запустите kokky через локальный сервер — и всё заработает."
       )
     );
 
@@ -1498,7 +1469,7 @@
 
     const input = el("input", "dialog__input");
     input.type = "search";
-    input.placeholder = "найти трек на YouTube";
+    input.placeholder = "найти трек на SoundCloud";
     input.autocomplete = "off";
     input.spellcheck = false;
     input.setAttribute("aria-label", "Поиск трека");
@@ -1560,7 +1531,7 @@
       });
     };
 
-    paint(feed.slice(0, 30), feed.length ? "тренды YouTube" : "начните вводить название");
+    paint(feed.slice(0, 30), feed.length ? "тренды SoundCloud" : "начните вводить название");
 
     let timer = 0;
     let controller = null;
@@ -1569,7 +1540,7 @@
     const runSearch = async (query, currentToken) => {
       controller = new AbortController();
       try {
-        const remote = await fetchYouTubeTracks(query, 24, controller.signal);
+        const remote = await searchSoundCloud(query, 24, controller.signal);
         if (currentToken !== token) return;
         const merged = dedupe([...filterTracks(query), ...remote]);
         paint(merged, `найдено · ${merged.length}`);
@@ -1587,7 +1558,7 @@
       const query = input.value.trim();
 
       if (!query) {
-        paint(feed.slice(0, 30), feed.length ? "тренды YouTube" : "начните вводить название");
+        paint(feed.slice(0, 30), feed.length ? "тренды SoundCloud" : "начните вводить название");
         return;
       }
 
@@ -1705,7 +1676,7 @@
       const text = el("div", "pl-empty__text");
       text.append(
         el("strong", "", "пока пусто"),
-        el("p", "", "добавьте первый трек — поиск идёт по всему каталогу YouTube.")
+        el("p", "", "добавьте первый трек — поиск идёт по всему каталогу SoundCloud.")
       );
 
       const add = el("button", "ghost-pill", "Добавить трек");
@@ -1948,10 +1919,19 @@
     feed = dedupe(list);
     feedError = false;
 
-    if (!state.current && feed.length) {
-      state.queue = feed;
-      state.index = 0;
-      loadTrack(feed[0], { autoplay: false });
+    if (feed.length) {
+      const inFeed = feed.some((track) => track.id === state.current?.id);
+      if (!state.current || (!state.started && !inFeed)) {
+        state.current = feed[0];
+        updateTrackUI(feed[0]);
+      }
+      if (!state.started) {
+        state.queue = feed;
+        state.index = Math.max(
+          0,
+          feed.findIndex((track) => track.id === state.current.id)
+        );
+      }
     }
 
     if (!dom.searchInput.value.trim()) {
@@ -1999,7 +1979,7 @@
     if (FILE_MODE) {
       dom.artNotice.hidden = false;
     } else {
-      loadYouTubeApi();
+      createPlayer();
     }
 
     loadFeed();

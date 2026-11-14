@@ -1,25 +1,24 @@
 window.KOKKY = {
   source: {
-    name: "YouTube",
-    url: "https://www.youtube.com",
+    name: "SoundCloud",
+    url: "https://soundcloud.com",
     about: "полные треки · без аккаунта",
   },
-  // Необязательный ключ YouTube Data API v3. Если указать — поиск пойдёт через
-  // официальный API Google, а не через публичные Piped-инстансы.
-  youtube: {
-    apiKey: "",
+  // SoundCloud не отдаёт CORS для поиска, поэтому запросы идут через
+  // маленький прокси. По умолчанию — публичный r.jina.ai (без ключа).
+  // Если развернёте свой воркер (см. worker/README.md) — укажите его адрес:
+  // proxy: "https://kokky-sc.example.workers.dev/?url="
+  soundcloud: {
+    clientId: "qLcgHhXgeEFFaSolTB9I71LBsqncsD93",
+    proxy: "",
   },
-  // Публичные Piped-инстансы для поиска. Используется первый доступный.
-  piped: [
-    "https://api.piped.private.coffee",
-    "https://pipedapi.ducks.party",
-  ],
   // Запросы, из которых собирается «Мой поток».
   feedQueries: [
-    "pop music",
-    "hip hop music",
-    "rock music",
-    "r&b music",
-    "indie music",
+    "pop hits",
+    "hip hop",
+    "r&b",
+    "electronic",
+    "indie",
+    "chill",
   ],
 };
