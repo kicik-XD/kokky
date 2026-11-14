@@ -4,15 +4,26 @@
   const library = window.KOKKY;
   if (!library) return;
 
-  const API = "https://api.audius.co";
-  const APP_NAME = "KOKKY";
-  const STREAM = `${API}/v1/tracks`;
+  const FILE_MODE = window.location.protocol === "file:";
+
+  const PIPED =
+    Array.isArray(library.piped) && library.piped.length
+      ? library.piped
+      : ["https://api.piped.private.coffee", "https://pipedapi.ducks.party"];
+
+  const FEED_QUERIES =
+    Array.isArray(library.feedQueries) && library.feedQueries.length
+      ? library.feedQueries
+      : ["pop music", "hip hop music", "rock music", "r&b music", "indie music"];
+
   const STORE = {
-    liked: "kokky:liked",
+    liked: "kokky:liked:yt",
     volume: "kokky:volume",
     motion: "kokky:motion",
-    playlists: "kokky:playlists",
+    playlists: "kokky:playlists:yt",
+    feed: "kokky:feed:yt",
   };
+
   const FALLBACK_COVER = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 480"><rect width="480" height="480" fill="#0d0d0d"/><path d="M240 152 336 328H144Z" fill="#262626"/></svg>'
   )}`;
@@ -30,60 +41,245 @@
   let feed = [];
   let feedError = false;
 
-  const cleanArtist = (track) =>
-    String(track.user?.name || track.user?.handle || "Audius")
-      .replace(/^@+/, "")
+  /* =========================================================
+     Track helpers
+     ========================================================= */
+
+  const ENTITIES = {
+    amp: "&",
+    lt: "<",
+    gt: ">",
+    quot: '"',
+    apos: "'",
+  };
+
+  const decodeEntities = (value) =>
+    String(value).replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos);/gi, (match, code) => {
+      const key = String(code).toLowerCase();
+      if (key.startsWith("#x")) return String.fromCodePoint(Number.parseInt(key.slice(2), 16));
+      if (key.startsWith("#")) return String.fromCodePoint(Number.parseInt(key.slice(1), 10));
+      return ENTITIES[key] || match;
+    });
+
+  const cleanArtist = (name) =>
+    decodeEntities(name || "YouTube")
+      .replace(/\s*-\s*Topic$/i, "")
       .replace(/\s+/g, " ")
-      .trim();
+      .trim() || "YouTube";
 
-  const fromAudius = (track) => ({
-    id: track.id,
-    title: String(track.title || "без названия").trim(),
-    artist: cleanArtist(track),
-    duration: Math.round(Number(track.duration) || 0),
-    cover: track.artwork?.["480x480"] || track.artwork?.["150x150"] || FALLBACK_COVER,
-    permalink: track.permalink ? `https://audius.co${track.permalink}` : library.source.url,
-    genre: track.genre || "",
-    album: null,
-  });
+  const videoIdFrom = (url) => {
+    const match = String(url || "").match(/[?&]v=([\w-]{11})/);
+    if (match) return match[1];
+    const tail = String(url || "").split("/").pop() || "";
+    return /^[\w-]{11}$/.test(tail) ? tail : "";
+  };
 
-  const isPlayable = (track) =>
+  const coverFor = (id) => `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
+
+  const fromPiped = (item) => {
+    if (!item || item.type === "channel" || item.type === "playlist") return null;
+    const id = videoIdFrom(item.url) || (item.id && /^[\w-]{11}$/.test(item.id) ? item.id : "");
+    if (!id) return null;
+    return {
+      id,
+      videoId: id,
+      title: decodeEntities(item.title || "без названия").trim() || "без названия",
+      artist: cleanArtist(item.uploaderName),
+      duration: Math.max(0, Math.round(Number(item.duration) || 0)),
+      cover: coverFor(id),
+      permalink: `https://www.youtube.com/watch?v=${id}`,
+      genre: "",
+      album: null,
+    };
+  };
+
+  const dedupe = (list) => {
+    const seen = new Set();
+    return list.filter((track) => {
+      if (!track || !track.id || seen.has(track.id)) return false;
+      seen.add(track.id);
+      return true;
+    });
+  };
+
+  const isCachedTrack = (track) =>
     !!track &&
-    !track.is_delete &&
-    track.is_streamable !== false &&
-    !track.is_stream_gated &&
-    Number(track.duration) > 30 &&
-    Number(track.duration) <= 1200;
+    typeof track.id === "string" &&
+    /^[\w-]{11}$/.test(track.id) &&
+    typeof track.title === "string";
 
-  const streamUrl = (track) =>
-    `${STREAM}/${encodeURIComponent(track.id)}/stream?app_name=${APP_NAME}`;
+  /* =========================================================
+     YouTube search (Piped or official Data API)
+     ========================================================= */
 
-  async function requestAudius(url, signal) {
-    const response = await fetch(url, { signal });
+  async function requestJson(url, signal) {
+    const response = await fetch(url, { signal, headers: { Accept: "application/json" } });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const json = await response.json();
-    return Array.isArray(json.data) ? json.data : [];
+    return response.json();
   }
 
-  async function fetchTrendingTracks() {
-    const base = `${API}/v1/tracks/trending?app_name=${APP_NAME}&limit=40`;
-    let raw = [];
-    try {
-      raw = await requestAudius(`${base}&time=week`);
-    } catch (_) {
-      /* retry without the time filter below */
+  async function pipedJson(path, signal) {
+    let lastError = null;
+
+    for (const base of PIPED) {
+      try {
+        const json = await requestJson(`${base}${path}`, signal);
+        if (!json || typeof json !== "object") throw new Error("bad payload");
+        return json;
+      } catch (error) {
+        if (error && error.name === "AbortError") throw error;
+        lastError = error;
+      }
     }
-    if (!raw.length) raw = await requestAudius(base);
-    return raw.filter(isPlayable).map(fromAudius);
+
+    throw lastError || new Error("piped unavailable");
   }
 
-  async function fetchAudiusTracks(query, limit = 24, signal) {
-    const url = `${API}/v1/tracks/search?query=${encodeURIComponent(
-      query
-    )}&limit=${limit}&app_name=${APP_NAME}`;
-    const raw = await requestAudius(url, signal);
-    return raw.filter(isPlayable).map(fromAudius);
+  async function searchPiped(query, limit = 24, signal, maxSeconds = 5400) {
+    const json = await pipedJson(
+      `/search?q=${encodeURIComponent(query)}&filter=music_songs`,
+      signal
+    );
+    const items = Array.isArray(json.items) ? json.items : [];
+
+    const tracks = items
+      .map(fromPiped)
+      .filter(Boolean)
+      .filter(
+        (track) =>
+          track.duration === 0 || (track.duration >= 30 && track.duration <= maxSeconds)
+      );
+
+    return dedupe(tracks).slice(0, limit);
   }
+
+  function parseISODuration(value) {
+    const match = String(value || "").match(
+      /^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/
+    );
+    if (!match) return 0;
+    return (
+      (Number(match[1]) || 0) * 86400 +
+      (Number(match[2]) || 0) * 3600 +
+      (Number(match[3]) || 0) * 60 +
+      (Number(match[4]) || 0)
+    );
+  }
+
+  async function searchOfficial(query, limit = 24, signal) {
+    const key = library.youtube?.apiKey;
+    const base = "https://www.googleapis.com/youtube/v3";
+    const max = Math.min(25, Math.max(1, limit));
+
+    const found = await requestJson(
+      `${base}/search?part=snippet&type=video&videoCategoryId=10&maxResults=${max}` +
+        `&q=${encodeURIComponent(query)}&key=${encodeURIComponent(key)}`,
+      signal
+    );
+
+    const items = Array.isArray(found.items) ? found.items : [];
+    const ids = items.map((item) => item.id?.videoId).filter(Boolean);
+    if (!ids.length) return [];
+
+    let durations = new Map();
+    try {
+      const details = await requestJson(
+        `${base}/videos?part=contentDetails&id=${ids.join(",")}` +
+          `&key=${encodeURIComponent(key)}`,
+        signal
+      );
+      durations = new Map(
+        (details.items || []).map((item) => [
+          item.id,
+          parseISODuration(item.contentDetails?.duration),
+        ])
+      );
+    } catch (_) {
+      /* длительности необязательны — плеер уточнит их сам */
+    }
+
+    return items
+      .map((item) => {
+        const id = item.id?.videoId;
+        if (!id) return null;
+        return {
+          id,
+          videoId: id,
+          title: decodeEntities(item.snippet?.title || "без названия").trim(),
+          artist: cleanArtist(item.snippet?.channelTitle),
+          duration: durations.get(id) || 0,
+          cover: coverFor(id),
+          permalink: `https://www.youtube.com/watch?v=${id}`,
+          genre: "",
+          album: null,
+        };
+      })
+      .filter(Boolean);
+  }
+
+  function fetchYouTubeTracks(query, limit = 24, signal) {
+    if (library.youtube?.apiKey) return searchOfficial(query, limit, signal);
+    return searchPiped(query, limit, signal);
+  }
+
+  function readFeedCache() {
+    try {
+      const cached = JSON.parse(localStorage.getItem(STORE.feed) || "null");
+      if (!cached || !Array.isArray(cached.tracks)) return { tracks: [], at: 0 };
+      return {
+        tracks: cached.tracks.filter(isCachedTrack),
+        at: Number(cached.at) || 0,
+      };
+    } catch (_) {
+      return { tracks: [], at: 0 };
+    }
+  }
+
+  function writeFeedCache(tracks) {
+    try {
+      localStorage.setItem(
+        STORE.feed,
+        JSON.stringify({ at: Date.now(), tracks: tracks.slice(0, 60) })
+      );
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  async function fetchFeed() {
+    const settled = await Promise.allSettled(
+      FEED_QUERIES.map((query) => searchPiped(query, 20, undefined, 900))
+    );
+
+    const lists = settled
+      .filter((result) => result.status === "fulfilled" && result.value.length)
+      .map((result) => result.value);
+
+    if (!lists.length) throw new Error("feed unavailable");
+
+    const merged = [];
+    const seen = new Set();
+
+    for (let index = 0; merged.length < 60; index += 1) {
+      let added = false;
+      for (const list of lists) {
+        const track = list[index];
+        if (!track) continue;
+        added = true;
+        if (seen.has(track.id)) continue;
+        seen.add(track.id);
+        merged.push(track);
+        if (merged.length >= 60) break;
+      }
+      if (!added) break;
+    }
+
+    return merged;
+  }
+
+  /* =========================================================
+     Player state
+     ========================================================= */
 
   const state = {
     view: "stream",
@@ -94,6 +290,7 @@
     volume: 0.8,
     muted: false,
     closed: false,
+    playing: false,
   };
 
   try {
@@ -131,7 +328,9 @@
   const dom = {
     body: document.body,
     stage: $("#stage"),
-    audio: $("#audio"),
+    art: $(".art"),
+    artNotice: $("#artNotice"),
+    serverHelpBtn: $("#serverHelpBtn"),
     playerView: $("#view-stream"),
     views: {
       stream: $("#view-stream"),
@@ -184,15 +383,11 @@
     menus: [$("#topMenu"), $("#trackMenu"), $("#settingsMenu")],
   };
 
-  const audio = dom.audio;
-  audio.volume = state.volume;
-
   let rafId = null;
   let lastProgress = -1;
   let lastSecond = -1;
   let toastTimer = null;
   let scrubbing = false;
-  let loadId = 0;
 
   /* =========================================================
      Helpers
@@ -211,11 +406,6 @@
     if (last === 1 && lastTwo !== 11) return "трек";
     if (last >= 2 && last <= 4 && (lastTwo < 10 || lastTwo >= 20)) return "трека";
     return "треков";
-  };
-
-  const getDuration = () => {
-    if (Number.isFinite(audio.duration) && audio.duration > 0) return audio.duration;
-    return state.current?.duration || 30;
   };
 
   const isLiked = (track) => !!track && state.liked.has(track.id);
@@ -309,7 +499,7 @@
     }
 
     if (action === "about") {
-      toast("kokky · полные треки с Audius · без аккаунта");
+      toast("kokky · полные треки с YouTube · без аккаунта");
     }
 
     if (action === "add-to-playlist") {
@@ -394,18 +584,18 @@
   }
 
   function resetProgressUI() {
-    const duration = state.current?.duration || 30;
+    const duration = state.current?.duration || 0;
     lastProgress = -1;
     lastSecond = -1;
     dom.seekFill.style.width = "0%";
     dom.seekTime.textContent = `0:00 / ${formatTime(duration)}`;
     dom.seek.setAttribute("aria-valuenow", "0");
-    dom.seek.setAttribute("aria-valuemax", String(Math.round(duration)));
+    dom.seek.setAttribute("aria-valuemax", String(Math.max(1, Math.round(duration))));
   }
 
   function updateProgress() {
     const duration = getDuration();
-    const current = Math.min(audio.currentTime || 0, duration);
+    const current = duration > 0 ? Math.min(getCurrentTime(), duration) : 0;
     const percent = duration > 0 ? (current / duration) * 100 : 0;
     const second = Math.floor(current);
 
@@ -417,7 +607,7 @@
     if (second !== lastSecond) {
       dom.seekTime.textContent = `${formatTime(current)} / ${formatTime(duration)}`;
       dom.seek.setAttribute("aria-valuenow", String(second));
-      dom.seek.setAttribute("aria-valuemax", String(Math.round(duration)));
+      dom.seek.setAttribute("aria-valuemax", String(Math.max(1, Math.round(duration))));
       lastSecond = second;
     }
   }
@@ -440,7 +630,7 @@
   }
 
   function syncPlayState() {
-    const playing = !audio.paused && !audio.ended;
+    const playing = !!state.playing;
     dom.body.classList.toggle("is-playing", playing);
     dom.playBtn.setAttribute("aria-label", playing ? "Пауза" : "Играть");
   }
@@ -478,8 +668,16 @@
 
   function applyVolume(persist = false) {
     const percent = Math.round(state.volume * 100);
-    audio.volume = state.volume;
-    audio.muted = state.muted || state.volume === 0;
+
+    if (ytReady) {
+      try {
+        ytPlayer.setVolume(percent);
+        if (state.muted || state.volume === 0) ytPlayer.mute();
+        else ytPlayer.unMute();
+      } catch (_) {
+        /* player is not ready yet */
+      }
+    }
 
     dom.volumeRange.value = String(percent);
     dom.volumeRange.style.setProperty("--vol", `${percent}%`);
@@ -500,8 +698,6 @@
     }
   }
 
-  audio.volume = state.volume;
-
   dom.volumeBtn.addEventListener("click", () => {
     if (state.muted || state.volume === 0) {
       state.muted = false;
@@ -520,55 +716,131 @@
   });
 
   /* =========================================================
-     Audio loading & transport
+     YouTube player
      ========================================================= */
+
+  let ytPlayer = null;
+  let ytReady = false;
+  let pendingCue = null;
+  let errorStreak = 0;
+
+  const PLAYER_STATE = {
+    UNSTARTED: -1,
+    ENDED: 0,
+    PLAYING: 1,
+    PAUSED: 2,
+    BUFFERING: 3,
+    CUED: 5,
+  };
+
+  function getDuration() {
+    if (ytReady) {
+      try {
+        const live = Number(ytPlayer.getDuration());
+        if (Number.isFinite(live) && live > 0) return live;
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    return state.current?.duration || 0;
+  }
+
+  function getCurrentTime() {
+    if (!ytReady) return 0;
+    try {
+      return Number(ytPlayer.getCurrentTime()) || 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  function playerState() {
+    if (!ytReady) return PLAYER_STATE.UNSTARTED;
+    try {
+      return ytPlayer.getPlayerState();
+    } catch (_) {
+      return PLAYER_STATE.UNSTARTED;
+    }
+  }
+
+  function cueTrack(track, { autoplay = false } = {}) {
+    if (FILE_MODE) return;
+
+    if (!ytReady || !track) {
+      pendingCue = { autoplay };
+      return;
+    }
+
+    const id = track.videoId || track.id;
+    if (!/^[\w-]{11}$/.test(id)) {
+      toast("у этого трека нет видео YouTube · включите другой");
+      return;
+    }
+
+    pendingCue = null;
+    dom.art.classList.add("has-player");
+
+    try {
+      if (autoplay) ytPlayer.loadVideoById(id);
+      else ytPlayer.cueVideoById(id);
+    } catch (_) {
+      toast("не удалось включить трек · попробуйте ещё раз");
+    }
+  }
 
   function loadTrack(track, { autoplay = false } = {}) {
     if (!track) return;
     state.current = track;
-    const id = ++loadId;
-
-    audio.pause();
-    audio.removeAttribute("src");
-    audio.load();
-
-    audio.src = streamUrl(track);
-    audio.load();
-    try {
-      audio.currentTime = 0;
-    } catch (_) {
-      /* metadata is not ready yet */
-    }
 
     updateTrackUI(track);
-
-    if (autoplay && id === loadId) {
-      playAudio({ silent: true });
-    }
+    cueTrack(track, { autoplay });
   }
 
-  async function playAudio({ silent = false } = {}) {
+  function playAudio({ silent = false } = {}) {
+    if (FILE_MODE) {
+      openServerHelp();
+      return;
+    }
+
     if (!state.current) return;
+    if (!ytReady) {
+      pendingCue = { autoplay: true };
+      return;
+    }
+
     try {
-      if (!audio.currentSrc) {
-        audio.src = streamUrl(state.current);
-        audio.load();
-      }
-      await audio.play();
-    } catch (error) {
-      if (!silent && error && error.name !== "AbortError") {
-        toast("не удалось включить трек · проверьте соединение");
-      }
+      ytPlayer.playVideo();
+    } catch (_) {
+      if (!silent) toast("не удалось включить трек · проверьте соединение");
     }
   }
 
-  async function togglePlay() {
+  function pauseAudio() {
+    if (!ytReady) return;
+    try {
+      ytPlayer.pauseVideo();
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  function togglePlay() {
+    if (FILE_MODE) {
+      openServerHelp();
+      return;
+    }
+
     if (!state.current) return;
-    if (audio.paused) {
-      if (!audio.currentSrc) loadTrack(state.current, { autoplay: true });
-      else playAudio();
+    const status = playerState();
+
+    if (status === PLAYER_STATE.PLAYING || status === PLAYER_STATE.BUFFERING) {
+      pauseAudio();
     } else {
-      audio.pause();
+      if (!ytReady || status === PLAYER_STATE.CUED || status === PLAYER_STATE.UNSTARTED) {
+        cueTrack(state.current, { autoplay: true });
+      } else {
+        playAudio();
+      }
     }
   }
 
@@ -582,7 +854,7 @@
   function closePlayer() {
     if (state.closed) return;
     state.closed = true;
-    audio.pause();
+    pauseAudio();
     setView("stream");
     dom.playerView.classList.add("is-closed");
     dom.stage.classList.add("is-idle");
@@ -591,12 +863,17 @@
 
   function step(direction) {
     if (!state.queue.length) return;
-    const wasPlaying = !audio.paused;
+    const wasPlaying = state.playing;
     state.index = (state.index + direction + state.queue.length) % state.queue.length;
     loadTrack(state.queue[state.index], { autoplay: wasPlaying });
   }
 
   function playTrack(track, queue = feed) {
+    if (FILE_MODE) {
+      openServerHelp();
+      return;
+    }
+
     const list = queue.filter(Boolean);
     let index = list.findIndex((item) => item.id === track.id);
     if (index < 0) {
@@ -610,6 +887,11 @@
   }
 
   function startQueue(queue, startIndex = 0) {
+    if (FILE_MODE) {
+      openServerHelp();
+      return;
+    }
+
     const list = queue.filter(Boolean);
     if (!list.length) return;
     const index = Math.min(Math.max(0, startIndex), list.length - 1);
@@ -640,8 +922,8 @@
   dom.playBtn.addEventListener("click", togglePlay);
   dom.nextBtn.addEventListener("click", () => step(1));
   dom.prevBtn.addEventListener("click", () => {
-    if (audio.currentTime > 3) {
-      audio.currentTime = 0;
+    if (getCurrentTime() > 3) {
+      seekTo(0);
       updateProgress();
       return;
     }
@@ -655,15 +937,20 @@
      Seek
      ========================================================= */
 
+  function seekTo(seconds) {
+    if (!ytReady) return;
+    try {
+      ytPlayer.seekTo(Math.max(0, seconds), true);
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
   function seekToRatio(ratio) {
     const duration = getDuration();
     if (!Number.isFinite(duration) || duration <= 0) return;
     const clamped = Math.min(1, Math.max(0, ratio));
-    try {
-      audio.currentTime = clamped * duration;
-    } catch (_) {
-      /* ignore */
-    }
+    seekTo(clamped * duration);
     updateProgress();
   }
 
@@ -702,12 +989,12 @@
     if (event.key === "ArrowRight") {
       event.preventDefault();
       event.stopPropagation();
-      seekToRatio((audio.currentTime + 5) / getDuration());
+      seekToRatio((getCurrentTime() + 5) / getDuration());
     }
     if (event.key === "ArrowLeft") {
       event.preventDefault();
       event.stopPropagation();
-      seekToRatio((audio.currentTime - 5) / getDuration());
+      seekToRatio((getCurrentTime() - 5) / getDuration());
     }
     if (event.key === "Home") {
       event.preventDefault();
@@ -720,39 +1007,129 @@
   });
 
   /* =========================================================
-     Audio events
+     YouTube player lifecycle
      ========================================================= */
 
-  audio.addEventListener("play", () => {
-    syncPlayState();
-    startTicker();
-  });
+  function handlePlayerReady() {
+    ytReady = true;
+    applyVolume();
 
-  audio.addEventListener("pause", () => {
-    syncPlayState();
-    stopTicker();
-  });
+    if (state.current) {
+      cueTrack(state.current, { autoplay: !!pendingCue?.autoplay });
+    }
+  }
 
-  audio.addEventListener("loadedmetadata", updateProgress);
-  audio.addEventListener("durationchange", updateProgress);
-  audio.addEventListener("seeked", updateProgress);
+  function handlePlayerState(event) {
+    const status = event.data;
 
-  audio.addEventListener("ended", () => {
-    if (state.queue.length > 1) {
-      state.index = (state.index + 1) % state.queue.length;
-      loadTrack(state.queue[state.index], { autoplay: true });
-    } else {
-      audio.currentTime = 0;
+    if (status === PLAYER_STATE.PLAYING) {
+      errorStreak = 0;
+      state.playing = true;
       syncPlayState();
+      startTicker();
+      updateProgress();
+      return;
+    }
+
+    if (status === PLAYER_STATE.PAUSED) {
+      state.playing = false;
+      syncPlayState();
+      stopTicker();
+      return;
+    }
+
+    if (status === PLAYER_STATE.ENDED) {
+      state.playing = false;
+      syncPlayState();
+      stopTicker();
+      if (state.queue.length > 1) {
+        state.index = (state.index + 1) % state.queue.length;
+        loadTrack(state.queue[state.index], { autoplay: true });
+      } else {
+        seekTo(0);
+        updateProgress();
+      }
+      return;
+    }
+
+    if (status === PLAYER_STATE.CUED || status === PLAYER_STATE.UNSTARTED) {
       updateProgress();
     }
-  });
+  }
 
-  audio.addEventListener("error", () => {
-    if (!state.current) return;
-    toast("трек недоступен · включите другой");
+  function handlePlayerError(event) {
+    const code = Number(event?.data);
+    state.playing = false;
     syncPlayState();
-  });
+
+    if (code === 150 || code === 101) {
+      toast("видео запрещено встраивать · включаем следующий");
+    } else if (code === 100 || code === 2) {
+      toast("трек недоступен · включаем следующий");
+    } else {
+      toast("не удалось включить трек · проверьте соединение");
+    }
+
+    errorStreak += 1;
+    if (errorStreak > 5) {
+      errorStreak = 0;
+      toast("несколько треков подряд недоступны · попробуйте поиск");
+      return;
+    }
+
+    if (state.queue.length > 1) {
+      window.setTimeout(() => step(1), 700);
+    }
+  }
+
+  function createPlayer() {
+    if (ytPlayer) return;
+
+    const vars = {
+      autoplay: 0,
+      controls: 0,
+      disablekb: 1,
+      modestbranding: 1,
+      rel: 0,
+      playsinline: 1,
+      fs: 0,
+      iv_load_policy: 3,
+    };
+
+    if (window.location.protocol === "http:" || window.location.protocol === "https:") {
+      vars.origin = window.location.origin;
+    }
+
+    ytPlayer = new window.YT.Player("ytPlayer", {
+      width: "100%",
+      height: "100%",
+      playerVars: vars,
+      events: {
+        onReady: handlePlayerReady,
+        onStateChange: handlePlayerState,
+        onError: handlePlayerError,
+      },
+    });
+  }
+
+  function loadYouTubeApi() {
+    if (FILE_MODE) return;
+
+    if (window.YT && window.YT.Player) {
+      createPlayer();
+      return;
+    }
+
+    window.onYouTubeIframeAPIReady = createPlayer;
+
+    const script = document.createElement("script");
+    script.src = "https://www.youtube.com/iframe_api";
+    script.async = true;
+    script.addEventListener("error", () => {
+      toast("YouTube недоступен · проверьте соединение");
+    });
+    document.head.appendChild(script);
+  }
 
   /* =========================================================
      Search
@@ -777,15 +1154,6 @@
     );
   };
 
-  const dedupe = (list) => {
-    const seen = new Set();
-    return list.filter((track) => {
-      if (seen.has(track.id)) return false;
-      seen.add(track.id);
-      return true;
-    });
-  };
-
   function createResultRow(track, queue) {
     const row = el("button", "result");
     row.type = "button";
@@ -801,7 +1169,12 @@
     const text = el("span", "result__text");
     text.appendChild(el("span", "result__title", track.title));
     text.appendChild(
-      el("span", "result__meta", `${track.artist} · ${track.album || track.genre || library.source.name}`)
+      el(
+        "span",
+        "result__meta",
+        [track.artist, track.album, track.genre].filter(Boolean).join(" · ") ||
+          library.source.name
+      )
     );
 
     const duration = el("span", "result__dur", formatTime(track.duration));
@@ -864,7 +1237,7 @@
       const controller = new AbortController();
       searchController = controller;
       try {
-        const remote = await fetchAudiusTracks(query, 30, controller.signal);
+        const remote = await fetchYouTubeTracks(query, 30, controller.signal);
         if (token !== searchToken || dom.searchInput.value.trim() !== query) return;
 
         const merged = dedupe([...local, ...remote]);
@@ -888,17 +1261,17 @@
     if (!normalized) {
       cancelSearch();
       if (feed.length) {
-        paintResults(feed, `тренды Audius · ${feed.length}`);
+        paintResults(feed, `тренды YouTube · ${feed.length}`);
       } else {
         paintNotice(
-          feedError ? "не удалось загрузить тренды · попробуйте поиск" : "загружаем тренды Audius…"
+          feedError ? "не удалось загрузить тренды · попробуйте поиск" : "загружаем тренды YouTube…"
         );
       }
       return;
     }
 
     const local = filterTracks(normalized);
-    paintResults(local, local.length ? `найдено · ${local.length}` : "ищем в Audius…");
+    paintResults(local, local.length ? `найдено · ${local.length}` : "ищем на YouTube…");
     scheduleSearch(normalized, local);
   }
 
@@ -981,6 +1354,59 @@
   dom.playlistDialog.addEventListener("click", (event) => {
     if (event.target.closest("[data-close-dialog]")) closeDialog();
   });
+
+  function appDirectory() {
+    try {
+      const path = decodeURIComponent(window.location.pathname || "").replace(/^\/+/, "");
+      const dir = path.replace(/\/[^/]+$/, "");
+      return (dir || "C:\\Users\\Admin\\kokky").replace(/\//g, "\\");
+    } catch (_) {
+      return "C:\\Users\\Admin\\kokky";
+    }
+  }
+
+  function openServerHelp() {
+    const panel = el("div", "dialog__help");
+
+    panel.appendChild(
+      el(
+        "p",
+        "dialog__hint",
+        "YouTube запрещает встроенный плеер на страницах file://. Запустите kokky через локальный сервер — и всё заработает."
+      )
+    );
+
+    const steps = el("ol", "dialog__steps");
+    steps.append(
+      el("li", "", "Дважды кликните start.bat в папке kokky."),
+      el("li", "", "Откроется http://localhost:8000 — играйте и добавляйте треки.")
+    );
+    panel.appendChild(steps);
+
+    const command = `cd ${appDirectory()}\npython -m http.server 8000`;
+    panel.appendChild(el("pre", "dialog__code", command));
+
+    const actions = el("div", "dialog__actions");
+
+    const copy = el("button", "ghost-pill", "Скопировать команду");
+    copy.type = "button";
+    copy.addEventListener("click", () => {
+      copyText(command).then((ok) => {
+        toast(ok ? "команда скопирована" : "не удалось скопировать");
+      });
+    });
+
+    const done = el("button", "solid-pill", "Понятно");
+    done.type = "button";
+    done.addEventListener("click", closeDialog);
+
+    actions.append(copy, done);
+    panel.appendChild(actions);
+
+    showDialog("как запустить", [panel]);
+  }
+
+  dom.serverHelpBtn.addEventListener("click", openServerHelp);
 
   function openCreateDialog(pendingTrack = null) {
     const form = el("form", "dialog__form");
@@ -1072,7 +1498,7 @@
 
     const input = el("input", "dialog__input");
     input.type = "search";
-    input.placeholder = "найти трек в Audius";
+    input.placeholder = "найти трек на YouTube";
     input.autocomplete = "off";
     input.spellcheck = false;
     input.setAttribute("aria-label", "Поиск трека");
@@ -1134,7 +1560,7 @@
       });
     };
 
-    paint(feed.slice(0, 30), feed.length ? "тренды Audius" : "начните вводить название");
+    paint(feed.slice(0, 30), feed.length ? "тренды YouTube" : "начните вводить название");
 
     let timer = 0;
     let controller = null;
@@ -1143,7 +1569,7 @@
     const runSearch = async (query, currentToken) => {
       controller = new AbortController();
       try {
-        const remote = await fetchAudiusTracks(query, 24, controller.signal);
+        const remote = await fetchYouTubeTracks(query, 24, controller.signal);
         if (currentToken !== token) return;
         const merged = dedupe([...filterTracks(query), ...remote]);
         paint(merged, `найдено · ${merged.length}`);
@@ -1161,7 +1587,7 @@
       const query = input.value.trim();
 
       if (!query) {
-        paint(feed.slice(0, 30), feed.length ? "тренды Audius" : "начните вводить название");
+        paint(feed.slice(0, 30), feed.length ? "тренды YouTube" : "начните вводить название");
         return;
       }
 
@@ -1279,7 +1705,7 @@
       const text = el("div", "pl-empty__text");
       text.append(
         el("strong", "", "пока пусто"),
-        el("p", "", "добавьте первый трек — поиск идёт по всему каталогу Audius.")
+        el("p", "", "добавьте первый трек — поиск идёт по всему каталогу YouTube.")
       );
 
       const add = el("button", "ghost-pill", "Добавить трек");
@@ -1410,7 +1836,7 @@
       return;
     }
 
-    if (target instanceof Element && target.closest('button, a, [role="slider"]')) {
+    if (target instanceof Element && target.closest('button, a, [role="slider"], iframe')) {
       return;
     }
 
@@ -1421,12 +1847,12 @@
 
     if (event.key === "ArrowRight") {
       event.preventDefault();
-      seekToRatio((audio.currentTime + 5) / getDuration());
+      seekToRatio((getCurrentTime() + 5) / getDuration());
     }
 
     if (event.key === "ArrowLeft") {
       event.preventDefault();
-      seekToRatio((audio.currentTime - 5) / getDuration());
+      seekToRatio((getCurrentTime() - 5) / getDuration());
     }
 
     if (event.key === "ArrowUp") {
@@ -1458,14 +1884,14 @@
     if (!("mediaSession" in navigator)) return;
     try {
       navigator.mediaSession.setActionHandler("play", () => playAudio());
-      navigator.mediaSession.setActionHandler("pause", () => audio.pause());
+      navigator.mediaSession.setActionHandler("pause", () => pauseAudio());
       navigator.mediaSession.setActionHandler("previoustrack", () => step(-1));
       navigator.mediaSession.setActionHandler("nexttrack", () => step(1));
       navigator.mediaSession.setActionHandler("seekbackward", () =>
-        seekToRatio((audio.currentTime - 5) / getDuration())
+        seekToRatio((getCurrentTime() - 5) / getDuration())
       );
       navigator.mediaSession.setActionHandler("seekforward", () =>
-        seekToRatio((audio.currentTime + 5) / getDuration())
+        seekToRatio((getCurrentTime() + 5) / getDuration())
       );
       mediaSessionReady = true;
     } catch (_) {
@@ -1518,28 +1944,39 @@
 
   let feedRequested = false;
 
+  function adoptFeed(list) {
+    feed = dedupe(list);
+    feedError = false;
+
+    if (!state.current && feed.length) {
+      state.queue = feed;
+      state.index = 0;
+      loadTrack(feed[0], { autoplay: false });
+    }
+
+    if (!dom.searchInput.value.trim()) {
+      renderResults();
+    }
+  }
+
+  function loadCachedFeed() {
+    const cached = readFeedCache();
+    if (!cached.tracks.length) return;
+    adoptFeed(cached.tracks);
+  }
+
   async function loadFeed() {
     if (feedRequested) return;
     feedRequested = true;
 
     try {
-      const list = dedupe(await fetchTrendingTracks());
+      const list = await fetchFeed();
       if (!list.length) throw new Error("empty feed");
 
-      feed = list;
-      feedError = false;
-
-      if (!state.current) {
-        state.queue = list;
-        state.index = 0;
-        loadTrack(list[0], { autoplay: false });
-      }
-
-      if (state.view === "search" && !dom.searchInput.value.trim()) {
-        renderResults();
-      }
+      writeFeedCache(list);
+      adoptFeed(list);
     } catch (_) {
-      feedError = true;
+      feedError = feed.length === 0;
       if (state.view === "search" && !dom.searchInput.value.trim()) {
         renderResults();
       }
@@ -1554,9 +1991,17 @@
     renderPlaylists();
     applyVolume();
     setupMediaSession();
+    loadCachedFeed();
     syncPlayState();
     setView("stream");
     renderResults();
+
+    if (FILE_MODE) {
+      dom.artNotice.hidden = false;
+    } else {
+      loadYouTubeApi();
+    }
+
     loadFeed();
   }
 

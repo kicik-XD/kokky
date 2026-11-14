@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#050505">
   <title>kokky — музыка</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%23050505'/%3E%3Cpath d='M12 4.8 20 19.2H4Z' fill='%23f2f2f2'/%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -68,7 +69,7 @@
               <span class="menu__check" id="motionCheck" aria-hidden="true">✓</span>
             </button>
             <button class="menu__item" type="button" role="menuitem" data-action="clear-likes">Очистить избранное</button>
-            <p class="menu__note">аудио: Audius · без аккаунта</p>
+            <p class="menu__note">аудио: YouTube · без аккаунта</p>
           </div>
         </div>
       </div>
@@ -97,10 +98,10 @@
           </button>
 
           <div class="menu menu--top" id="topMenu" role="menu">
-            <a class="menu__item" role="menuitem" href="https://audius.co" target="_blank" rel="noopener">Каталог Audius</a>
+            <a class="menu__item" role="menuitem" href="https://www.youtube.com" target="_blank" rel="noopener">Открыть YouTube</a>
             <button class="menu__item" type="button" role="menuitem" data-action="shortcuts">Горячие клавиши</button>
             <button class="menu__item" type="button" role="menuitem" data-action="about">О kokky</button>
-            <p class="menu__note">полные треки · Audius</p>
+            <p class="menu__note">полные треки · YouTube</p>
           </div>
         </div>
       </header>
@@ -110,9 +111,20 @@
           <p class="eyebrow">Мой поток</p>
           <h1 class="artist" id="artistName">kokky</h1>
 
-          <div class="art">
+          <div class="art" id="art">
             <span class="art__halo" aria-hidden="true"></span>
             <img class="art__img" id="coverImage" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 480 480'%3E%3Crect width='480' height='480' fill='%230d0d0d'/%3E%3Cpath d='M240 152 336 328H144Z' fill='%23262626'/%3E%3C/svg%3E" alt="Обложка трека">
+            <div class="art__frame" id="artFrame">
+              <div id="ytPlayer"></div>
+            </div>
+            <div class="art__notice" id="artNotice" hidden>
+              <span class="art__notice-mark" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M12 3.2 21.6 20.4H2.4L12 3.2Z" fill="currentColor"/></svg>
+              </span>
+              <strong class="art__notice-title">нужен локальный сервер</strong>
+              <span class="art__notice-text">YouTube не играет со страницы <code>file://</code></span>
+              <button class="ghost-pill" id="serverHelpBtn" type="button">Как запустить</button>
+            </div>
           </div>
 
           <p class="track"><span class="track__name" id="trackTitle">загружаем тренды…</span></p>
@@ -169,7 +181,7 @@
                 </button>
 
                 <div class="menu menu--track" id="trackMenu" role="menu">
-                  <a class="menu__item" id="trackSourceLink" role="menuitem" href="https://audius.co" target="_blank" rel="noopener">Слушать на Audius</a>
+                  <a class="menu__item" id="trackSourceLink" role="menuitem" href="https://www.youtube.com" target="_blank" rel="noopener">Слушать на YouTube</a>
                   <button class="menu__item" type="button" role="menuitem" data-action="add-to-playlist">Добавить в плейлист</button>
                   <button class="menu__item" type="button" role="menuitem" data-action="copy-link">Скопировать ссылку</button>
                 </div>
@@ -237,7 +249,7 @@
           <header class="page__head">
             <p class="eyebrow">Плейлисты</p>
             <h2 class="page__title">плейлисты.</h2>
-            <p class="page__sub">свои плейлисты · полные треки Audius</p>
+            <p class="page__sub">свои плейлисты · полные треки YouTube</p>
           </header>
           <div class="playlists" id="playlists"></div>
         </div>
@@ -278,7 +290,6 @@
     </main>
   </div>
 
-  <audio id="audio" preload="metadata"></audio>
   <script src="library.js"></script>
   <script src="app.js"></script>
 </body>
