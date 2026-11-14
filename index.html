@@ -50,6 +50,31 @@
         </button>
       </nav>
 
+      <div class="sidebar__bottom">
+        <button class="profile" type="button" title="Денис Гам...">
+          <img class="profile__avatar" src="assets/avatar.png" alt="">
+          <span class="profile__name">Денис Гам...</span>
+        </button>
+        <div class="settings-wrap">
+          <button class="icon-btn icon-btn--quiet" id="settingsBtn" type="button" aria-label="Настройки" aria-haspopup="menu" aria-expanded="false">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.6"/>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+
+          <div class="menu menu--settings" id="settingsMenu" role="menu">
+            <button class="menu__item" type="button" role="menuitem" data-action="toggle-motion">
+              Уменьшить движение
+              <span class="menu__check" id="motionCheck" aria-hidden="true">✓</span>
+            </button>
+            <button class="menu__item" type="button" role="menuitem" data-action="clear-likes">Очистить избранное</button>
+            <p class="menu__note">аудио: SoundCloud · без аккаунта</p>
+          </div>
+        </div>
+      </div>
+    </aside>
+
     <main class="stage" id="stage">
       <div class="ambient" aria-hidden="true">
         <span class="ambient__blob ambient__blob--one"></span>
