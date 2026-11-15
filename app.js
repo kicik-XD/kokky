@@ -343,8 +343,8 @@
     dialogTitle: $("#dialogTitle"),
     dialogBody: $("#dialogBody"),
     toast: $("#toast"),
-    menuButtons: [$("#topMenuBtn"), $("#trackMenuBtn"), $("#settingsBtn")],
-    menus: [$("#topMenu"), $("#trackMenu"), $("#settingsMenu")],
+    menuButtons: [$("#topMenuBtn"), $("#trackMenuBtn"), $("#settingsBtn")].filter(Boolean),
+    menus: [$("#topMenu"), $("#trackMenu"), $("#settingsMenu")].filter(Boolean),
   };
 
   let rafId = null;
@@ -422,10 +422,12 @@
 
   dom.topMenuBtn.addEventListener("click", () => toggleMenu(dom.topMenu, dom.topMenuBtn));
   dom.trackMenuBtn.addEventListener("click", () => toggleMenu(dom.trackMenu, dom.trackMenuBtn));
-  dom.settingsBtn.addEventListener("click", () => {
-    toggleMenu(dom.settingsMenu, dom.settingsBtn);
-    syncMotionUI();
-  });
+  if (dom.settingsBtn && dom.settingsMenu) {
+    dom.settingsBtn.addEventListener("click", () => {
+      toggleMenu(dom.settingsMenu, dom.settingsBtn);
+      syncMotionUI();
+    });
+  }
 
   document.addEventListener("pointerdown", (event) => {
     if (!event.target.closest(".menu") && !event.target.closest('[aria-haspopup="menu"]')) {
