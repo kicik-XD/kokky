@@ -19,12 +19,19 @@
       ? library.feedQueries
       : ["pop hits", "hip hop", "r&b", "electronic", "indie", "chill"];
 
+  // Курируемый список артистов СНГ из library.js.
+  const ARTISTS = Array.isArray(library.artists)
+    ? library.artists.filter((artist) => artist && artist.name)
+    : [];
+
   const STORE = {
     liked: "kokky:liked:sc",
     volume: "kokky:volume",
     motion: "kokky:motion",
     playlists: "kokky:playlists:sc",
     feed: "kokky:feed:sc",
+    artist: "kokky:artist:sc",
+    taste: "kokky:taste:sc",
   };
 
   const FALLBACK_COVER = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(
@@ -65,11 +72,11 @@
     });
 
   const cleanArtist = (name) =>
-    decodeEntities(name || "SoundCloud")
+    decodeEntities(name || "неизвестный артист")
       .replace(/\s+/g, " ")
-      .trim() || "SoundCloud";
+      .trim() || "неизвестный артист";
 
-  // Обложки SoundCloud бывают 100px и 500px — просим большую.
+  // Обложки каталога бывают 100px и 500px — просим большую.
   const coverFor = (url) => {
     const source = String(url || "");
     if (!source) return FALLBACK_COVER;
@@ -113,8 +120,9 @@
       artist: cleanArtist(item.user && item.user.username),
       duration,
       cover: coverFor(item.artwork_url || (item.user && item.user.avatar_url)),
-      permalink: item.permalink_url || "https://soundcloud.com",
+      permalink: item.permalink_url || "",
       genre: item.genre || "",
+      plays: Number(item.playback_count) || 0,
       album: null,
     };
   };
@@ -135,27 +143,55 @@
     typeof track.title === "string";
 
   /* =========================================================
-     SoundCloud search
+     Поиск по каталогу
      ========================================================= */
 
   function proxyUrl(url) {
     if (SC_CONFIG.proxy) return `${SC_CONFIG.proxy}${encodeURIComponent(url)}`;
     // r.jina.ai — публичный reader без ключа. Он отдаёт CORS и пропускает
-    // ответ SoundCloud как текст, из которого мы вырезаем JSON.
+    // ответ каталога как текст, из которого мы вырезаем JSON.
     return `https://r.jina.ai/${url}`;
   }
 
-  async function requestJson(url, signal) {
-    const response = await fetch(proxyUrl(url), {
-      signal,
-      headers: { Accept: "application/json, text/plain, */*" },
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  async function requestJson(url, signal, attempts = 3) {
+    let lastError = null;
 
-    const text = await response.text();
-    const start = text.indexOf("{");
-    if (start < 0) throw new Error("bad payload");
-    return JSON.parse(text.slice(start));
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        const response = await fetch(proxyUrl(url), {
+          signal,
+          headers: { Accept: "application/json, text/plain, */*" },
+        });
+        const text = await response.text();
+
+        if (!response.ok) {
+          // r.jina.ai на 429 присылает {"code":429,"retryAfter":N} —
+          // ждём столько, сколько просят, и пробуем ещё раз.
+          let wait = 900 + attempt * 900;
+          try {
+            const limit = JSON.parse(text);
+            const retryAfter = Number(limit && limit.retryAfter);
+            if (retryAfter > 0) wait = Math.min(5000, retryAfter * 1000 + 300);
+          } catch (_) {
+            /* not a json error */
+          }
+          const error = new Error(`HTTP ${response.status}`);
+          error.wait = wait;
+          throw error;
+        }
+
+        const start = text.indexOf("{");
+        if (start < 0) throw new Error("bad payload");
+        return JSON.parse(text.slice(start));
+      } catch (error) {
+        lastError = error;
+        if (error.name === "AbortError" || attempt === attempts - 1) throw error;
+        const wait = Number(error.wait) || 900 + attempt * 900;
+        await new Promise((resolve) => window.setTimeout(resolve, wait));
+      }
+    }
+
+    throw lastError;
   }
 
   function scUrl(path, params) {
@@ -207,15 +243,25 @@
   }
 
   async function fetchFeed() {
+    const seeds = feedSeeds();
+    const queries = seeds.length
+      ? [...seeds, ...FEED_QUERIES.slice(0, 3)]
+      : FEED_QUERIES;
+
     const settled = await Promise.allSettled(
-      FEED_QUERIES.map((query) =>
+      queries.map((query) =>
         searchSoundCloud(query, 20, AbortSignal.timeout(20000))
       )
     );
 
     const lists = settled
-      .filter((result) => result.status === "fulfilled" && result.value.length)
-      .map((result) => result.value);
+      .map((result, index) => {
+        if (result.status !== "fulfilled" || !result.value.length) return [];
+        return index < seeds.length
+          ? rankSeedResults(result.value, seeds[index])
+          : result.value;
+      })
+      .filter((list) => list.length);
 
     if (!lists.length) throw new Error("feed unavailable");
 
@@ -288,9 +334,121 @@
     /* ignore broken storage */
   }
 
+  /* =========================================================
+     Taste profile
+     ========================================================= */
+
+  const taste = { onboarded: false, artists: {}, queries: {}, genres: {} };
+
+  try {
+    const savedTaste = JSON.parse(localStorage.getItem(STORE.taste) || "null");
+    if (savedTaste && typeof savedTaste === "object") {
+      taste.onboarded = savedTaste.onboarded === true;
+      ["artists", "queries", "genres"].forEach((bucket) => {
+        const map = savedTaste[bucket];
+        if (!map || typeof map !== "object") return;
+        Object.entries(map).forEach(([name, score]) => {
+          const clean = String(name || "").replace(/\s+/g, " ").trim();
+          const value = Number(score);
+          if (clean && Number.isFinite(value) && value > 0) {
+            taste[bucket][clean] = Math.min(20, value);
+          }
+        });
+      });
+    }
+  } catch (_) {
+    /* ignore broken taste */
+  }
+
+  const tasteKey = (value) => normCompact(value);
+
+  function tasteTop(bucket, limit = 3) {
+    return Object.entries(taste[bucket])
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, limit)
+      .map(([name]) => name);
+  }
+
+  function rememberTaste(bucket, value, weight = 1) {
+    const clean = String(value || "").replace(/\s+/g, " ").trim();
+    if (clean.length < 2) return;
+    if (/^(неизвестно|неизвестный артист|без названия)$/i.test(clean)) return;
+
+    taste[bucket][clean] = Math.min(20, (taste[bucket][clean] || 0) + weight);
+    Object.entries(taste[bucket])
+      .sort((a, b) => b[1] - a[1])
+      .slice(12)
+      .forEach(([name]) => delete taste[bucket][name]);
+  }
+
+  function saveTaste() {
+    try {
+      localStorage.setItem(STORE.taste, JSON.stringify(taste));
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  function feedSeeds() {
+    const seeds = [];
+
+    const add = (value) => {
+      const clean = String(value || "").trim();
+      const key = tasteKey(clean);
+      if (!key || seeds.some((seed) => tasteKey(seed) === key)) return;
+      seeds.push(clean);
+    };
+
+    tasteTop("artists", 3).forEach(add);
+    tasteTop("queries", 2).forEach(add);
+    tasteTop("genres", 1).forEach(add);
+    return seeds.slice(0, 3);
+  }
+
+  // Для подборки по артисту поднимаем его официальные загрузки выше
+  // перезаливов и ремиксов, даже если у тех больше прослушиваний.
+  function rankSeedResults(list, seed) {
+    const key = normCompact(seed);
+    if (key.length < 2) return list;
+
+    const curated = ARTISTS.find((artist) =>
+      artistAliases(artist).some((alias) => normCompact(alias) === key)
+    );
+    const needles = curated ? artistNeedles(curated) : [key];
+    const patterns = curated ? artistPatterns(curated) : null;
+    const seedTitle = normText(seed).toLowerCase();
+
+    const official = [];
+    const titled = [];
+    const rest = [];
+
+    list.forEach((track) => {
+      const user = normCompact(track.artist);
+      const title = normText(track.title).toLowerCase();
+      const userHit = needles.some((needle) => user.includes(needle));
+      const titleHit = patterns
+        ? patterns.some((pattern) => pattern.test(title))
+        : title.startsWith(seedTitle);
+
+      if (userHit) official.push(track);
+      else if (titleHit) titled.push(track);
+      else rest.push(track);
+    });
+
+    if (official.length) return [...official, ...titled, ...rest];
+    if (titled.length) return [...titled, ...rest];
+    return list;
+  }
+
   const dom = {
     body: document.body,
     stage: $("#stage"),
+    player: $("#player"),
+    playerBody: $("#playerBody"),
+    streamWelcome: $("#streamWelcome"),
+    welcomeSearchBtn: $("#welcomeSearchBtn"),
+    welcomeChips: $("#welcomeChips"),
+    streamEyebrow: $("#streamEyebrow"),
     art: $(".art"),
     artNotice: $("#artNotice"),
     scPlayer: $("#scPlayer"),
@@ -299,6 +457,8 @@
     views: {
       stream: $("#view-stream"),
       search: $("#view-search"),
+      artists: $("#view-artists"),
+      artist: $("#view-artist"),
       playlists: $("#view-playlists"),
       playlist: $("#view-playlist"),
     },
@@ -318,6 +478,7 @@
     volumeBtn: $("#volumeBtn"),
     volumeRange: $("#volumeRange"),
     volumeValue: $("#volumeValue"),
+    volumePop: $("#volumePop"),
     volumeWrap: $("#volumeWrap"),
     trackMenuBtn: $("#trackMenuBtn"),
     trackMenu: $("#trackMenu"),
@@ -332,6 +493,13 @@
     reopenBtn: $("#reopenBtn"),
     searchInput: $("#searchInput"),
     results: $("#results"),
+    artists: $("#artists"),
+    artistBack: $("#artistBack"),
+    artistPageTitle: $("#artistPageTitle"),
+    artistMeta: $("#artistMeta"),
+    artistPlay: $("#artistPlay"),
+    artistShuffle: $("#artistShuffle"),
+    artistTracks: $("#artistTracks"),
     playlists: $("#playlists"),
     playlistBack: $("#playlistBack"),
     playlistTitle: $("#playlistTitle"),
@@ -346,6 +514,54 @@
     menuButtons: [$("#topMenuBtn"), $("#trackMenuBtn"), $("#settingsBtn")].filter(Boolean),
     menus: [$("#topMenu"), $("#trackMenu"), $("#settingsMenu")].filter(Boolean),
   };
+
+  function syncWelcome() {
+    const fresh = !taste.onboarded;
+    if (dom.playerBody) dom.playerBody.hidden = fresh;
+    if (dom.streamWelcome) dom.streamWelcome.hidden = !fresh;
+    if (dom.streamEyebrow) {
+      dom.streamEyebrow.textContent = taste.onboarded ? "Мой поток · под тебя" : "Мой поток";
+    }
+  }
+
+  function openSearchWith(query = "") {
+    dom.searchInput.value = query;
+    setView("search");
+  }
+
+  function noteTasteChange(firstTime) {
+    saveTaste();
+    syncWelcome();
+    scheduleFeedRefresh();
+    if (firstTime) toast("поток подстроится под тебя");
+  }
+
+  function learnFromQuery(query) {
+    const clean = String(query || "").trim();
+    if (clean.length < 2) return;
+    const firstTime = !taste.onboarded;
+    rememberTaste("queries", clean);
+    taste.onboarded = true;
+    noteTasteChange(firstTime);
+  }
+
+  function learnFromPlay(track) {
+    if (!track) return;
+    const firstTime = !taste.onboarded;
+    rememberTaste("artists", track.artist);
+    if (track.genre) rememberTaste("genres", track.genre);
+    taste.onboarded = true;
+    noteTasteChange(firstTime);
+  }
+
+  dom.welcomeSearchBtn?.addEventListener("click", () => openSearchWith(""));
+  dom.welcomeChips?.addEventListener("click", (event) => {
+    const chip = event.target.closest("[data-query]");
+    if (!chip) return;
+    const query = chip.dataset.query || "";
+    learnFromQuery(query);
+    openSearchWith(query);
+  });
 
   let rafId = null;
   let lastProgress = -1;
@@ -408,7 +624,7 @@
   function closeMenus() {
     dom.menus.forEach((menu) => menu.classList.remove("is-open"));
     dom.menuButtons.forEach((button) => button.setAttribute("aria-expanded", "false"));
-    dom.volumeWrap.classList.remove("is-open");
+    dom.volumePop.classList.remove("is-open");
   }
 
   function toggleMenu(menu, button) {
@@ -430,7 +646,11 @@
   }
 
   document.addEventListener("pointerdown", (event) => {
-    if (!event.target.closest(".menu") && !event.target.closest('[aria-haspopup="menu"]')) {
+    if (
+      !event.target.closest(".menu") &&
+      !event.target.closest('[aria-haspopup="menu"]') &&
+      !event.target.closest(".volume-wrap")
+    ) {
       closeMenus();
     }
   });
@@ -439,9 +659,6 @@
     if (event.key === "Escape") {
       closeMenus();
       if (dom.playlistDialog && !dom.playlistDialog.hidden) closeDialog();
-      if (dom.volumeWrap.classList.contains("is-open")) {
-        dom.volumeWrap.classList.remove("is-open");
-      }
     }
   });
 
@@ -465,7 +682,7 @@
     }
 
     if (action === "about") {
-      toast("kokky · полные треки с SoundCloud · без аккаунта");
+      toast("kokky · полные треки · без аккаунта");
     }
 
     if (action === "add-to-playlist") {
@@ -617,10 +834,12 @@
 
   function toggleLike() {
     if (!state.current) return;
-    if (state.liked.has(state.current.id)) {
-      state.liked.delete(state.current.id);
-    } else {
+    const adding = !state.liked.has(state.current.id);
+    if (adding) {
       state.liked.add(state.current.id);
+      learnFromPlay(state.current);
+    } else {
+      state.liked.delete(state.current.id);
     }
     persistLikes();
     syncLikeButtons(true);
@@ -670,6 +889,7 @@
       state.muted = true;
     }
     applyVolume(true);
+    dom.volumePop.classList.add("is-open");
   });
 
   dom.volumeRange.addEventListener("input", () => {
@@ -677,10 +897,15 @@
     state.volume = Math.min(1, Math.max(0, value));
     state.muted = false;
     applyVolume(true);
+    dom.volumePop.classList.add("is-open");
+  });
+
+  dom.volumeRange.addEventListener("pointerdown", () => {
+    dom.volumePop.classList.add("is-open");
   });
 
   /* =========================================================
-     SoundCloud player
+     Плеер
      ========================================================= */
 
   let scWidget = null;
@@ -800,6 +1025,11 @@
 
     if (!state.current) return;
 
+    if (!taste.onboarded) {
+      openSearchWith(dom.searchInput.value.trim());
+      return;
+    }
+
     if (state.playing) {
       pauseAudio();
       return;
@@ -851,6 +1081,7 @@
     state.index = index;
     openPlayer();
     loadTrack(list[index], { autoplay: true });
+    learnFromPlay(list[index]);
     setView("stream");
   }
 
@@ -867,6 +1098,7 @@
     state.index = index;
     openPlayer();
     loadTrack(list[index], { autoplay: true });
+    learnFromPlay(list[index]);
     setView("stream");
   }
 
@@ -977,7 +1209,7 @@
   });
 
   /* =========================================================
-     SoundCloud widget lifecycle
+     Жизненный цикл плеера
      ========================================================= */
 
   function handlePlayerReady() {
@@ -1021,6 +1253,10 @@
   }
 
   function handlePlayerError() {
+    // Пустой виджет на старте тоже умеет присылать ERROR — не пугаем
+    // пользователя тостом, пока трек не включён.
+    if (!state.started) return;
+
     state.playing = false;
     syncPlayState();
 
@@ -1071,12 +1307,12 @@
     try {
       await loadWidgetApi();
     } catch (_) {
-      toast("не удалось загрузить плеер SoundCloud · проверьте соединение");
+      toast("не удалось загрузить плеер · проверьте соединение");
       return;
     }
 
     if (!(await waitForWidgetApi())) {
-      toast("не удалось загрузить плеер SoundCloud · проверьте соединение");
+      toast("не удалось загрузить плеер · проверьте соединение");
       return;
     }
 
@@ -1100,7 +1336,7 @@
       });
     } catch (_) {
       scWidget = null;
-      toast("не удалось загрузить плеер SoundCloud · проверьте соединение");
+      toast("не удалось загрузить плеер · проверьте соединение");
     }
   }
 
@@ -1157,7 +1393,10 @@
       '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M8 4.8 20 12 8 19.2V4.8Z" fill="currentColor"/></svg>';
 
     row.append(cover, text, duration, play);
-    row.addEventListener("click", () => playTrack(track, queue));
+    row.addEventListener("click", () => {
+      if (state.view === "search") learnFromQuery(dom.searchInput.value);
+      playTrack(track, queue);
+    });
     return row;
   }
 
@@ -1165,6 +1404,9 @@
     if (!state.current) return;
     $$(".result", dom.results).forEach((row) => {
       row.classList.toggle("is-current", row.dataset.id === state.current.id);
+    });
+    $$(".artist-track", dom.artistTracks).forEach((row) => {
+      row.classList.toggle("is-current", row.dataset.trackId === state.current.id);
     });
   }
 
@@ -1234,27 +1476,434 @@
     if (!normalized) {
       cancelSearch();
       if (feed.length) {
-        paintResults(feed, `тренды SoundCloud · ${feed.length}`);
+        paintResults(feed, `тренды · ${feed.length}`);
       } else {
         paintNotice(
-          feedError ? "не удалось загрузить тренды · попробуйте поиск" : "загружаем тренды SoundCloud…"
+          feedError ? "не удалось загрузить тренды · попробуйте поиск" : "загружаем тренды…"
         );
       }
       return;
     }
 
     const local = filterTracks(normalized);
-    paintResults(local, local.length ? `найдено · ${local.length}` : "ищем на SoundCloud…");
+    paintResults(local, local.length ? `найдено · ${local.length}` : "ищем…");
     scheduleSearch(normalized, local);
   }
 
   dom.searchInput.addEventListener("input", () => renderResults(dom.searchInput.value));
 
   dom.searchInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      const query = dom.searchInput.value.trim();
+      if (query.length >= 2) {
+        event.preventDefault();
+        learnFromQuery(query);
+      }
+      return;
+    }
     if (event.key === "Escape" && dom.searchInput.value) {
       event.stopPropagation();
       dom.searchInput.value = "";
       renderResults();
+    }
+  });
+
+  /* =========================================================
+     Artists
+     ========================================================= */
+
+  // Кириллица и латиница в никах часто перемешаны
+  // («Cкриптoнит»), поэтому перед сравнением приводим похожие буквы
+  // к одному виду.
+  const HOMOGLYPHS = {
+    а: "a",
+    в: "b",
+    е: "e",
+    к: "k",
+    м: "m",
+    н: "h",
+    о: "o",
+    р: "p",
+    с: "c",
+    т: "t",
+    у: "y",
+    х: "x",
+    і: "i",
+    ј: "j",
+    ѕ: "s",
+  };
+
+  const foldText = (value) =>
+    String(value || "").replace(/[авекмнорстухіјѕ]/g, (char) => HOMOGLYPHS[char] || char);
+
+  const normText = (value) =>
+    foldText(decodeEntities(String(value || "")).toLowerCase().replace(/ё/g, "е"))
+      .replace(/[^\p{L}\p{N}]+/gu, " ")
+      .trim();
+
+  const normCompact = (value) => normText(value).replace(/\s+/g, "");
+
+  const escapeRe = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  const artistAliases = (artist) =>
+    [artist.name, ...(Array.isArray(artist.aliases) ? artist.aliases : [])].filter(Boolean);
+
+  const artistNeedles = (artist) =>
+    artistAliases(artist)
+      .map(normCompact)
+      .filter((needle) => needle.length >= 2);
+
+  // Длинные имена ищем где угодно («feat. Скриптонит»), короткие —
+  // только в начале названия, иначе «Кино» ловит «хочу сходить в кино».
+  const artistPatterns = (artist) =>
+    artistAliases(artist)
+      .map((alias) => {
+        const normalized = normText(alias);
+        const words = normalized.split(" ").filter(Boolean).map(escapeRe);
+        if (!words.length) return null;
+        const sequence = words.join("[\\s\\-–—_.]*");
+        const compact = normalized.replace(/\s+/g, "");
+        const left =
+          compact.length <= 5 ? "^[\\s\\-–—|:•·(\\[«\"]*" : "(?<![\\p{L}\\p{N}])";
+        return new RegExp(`${left}(?:${sequence})(?![\\p{L}\\p{N}])`, "iu");
+      })
+      .filter(Boolean);
+
+  const JUNK_UPLOAD =
+    /\b(speed ?up|sped ?up|slowed|reverb|nightcore|8d|bass ?boost(?:ed)?|tik ?tok|trending|flip)\b|#[\p{L}\p{N}_]{4,}|\.(?:mp3|wav|m4a|flac)\b/iu;
+
+  const ARTIST_TRACKS_MAX = 150;
+  const ARTIST_PAGES_MAX = 3;
+  const ARTIST_CACHE_TTL = 6 * 60 * 60 * 1000;
+
+  const byPlays = (list) =>
+    [...list].sort((a, b) => (Number(b.plays) || 0) - (Number(a.plays) || 0));
+
+  // Один и тот же трек часто перезалит десятком аккаунтов — оставляем
+  // самый популярный вариант.
+  function artistUnique(list) {
+    const ids = new Set();
+    const titles = new Set();
+    const result = [];
+
+    list.forEach((track) => {
+      if (!track || !track.id || ids.has(track.id)) return;
+      const key = normCompact(track.title);
+      if (titles.has(key)) return;
+      ids.add(track.id);
+      titles.add(key);
+      result.push(track);
+    });
+
+    return result;
+  }
+
+  function withClientId(href) {
+    if (!href) return "";
+    if (/[?&]client_id=/.test(href)) return href;
+    return `${href}${href.includes("?") ? "&" : "?"}client_id=${SC_CONFIG.clientId}`;
+  }
+
+  async function fetchArtistTracks(artist, { signal } = {}) {
+    const needles = artistNeedles(artist);
+    const patterns = artistPatterns(artist);
+    const found = [];
+    const official = new Set();
+
+    const collect = (items) => {
+      items.forEach((item) => {
+        const track = fromSoundCloud(item);
+        if (!track || JUNK_UPLOAD.test(track.title)) return;
+
+        const user = normCompact(track.artist);
+        const title = foldText(track.title).toLowerCase();
+        const userHit = needles.some((needle) => user.includes(needle));
+        const titleHit = patterns.some((pattern) => pattern.test(title));
+
+        // Совпадение только по названию — это чаще перезалив. Совсем
+        // непопулярные записи отсеиваем, чтобы в конце списка не было мусора.
+        if (!userHit && (!titleHit || (track.plays || 0) < 1000)) return;
+
+        if (userHit) official.add(track.id);
+        found.push(track);
+      });
+    };
+
+    let url = scUrl("/search/tracks", {
+      q: artist.query || artist.name,
+      limit: "50",
+      linked_partitioning: "1",
+    });
+
+    for (let page = 0; page < ARTIST_PAGES_MAX && url; page += 1) {
+      const json = await requestJson(url, signal);
+      collect(Array.isArray(json.collection) ? json.collection : []);
+
+      if (artistUnique(byPlays(found)).length >= 45) break;
+      url = typeof json.next_href === "string" ? withClientId(json.next_href) : "";
+    }
+
+    // Сначала треки с аккаунта самого артиста, потом перезаливы по
+    // популярности.
+    return artistUnique(byPlays(found))
+      .sort(
+        (a, b) =>
+          (official.has(b.id) ? 1 : 0) - (official.has(a.id) ? 1 : 0)
+      )
+      .slice(0, ARTIST_TRACKS_MAX);
+  }
+
+  const artistCache = new Map();
+
+  const artistStorageKey = (name) => `${STORE.artist}:${encodeURIComponent(name)}`;
+
+  function readArtistCache(name) {
+    if (artistCache.has(name)) return artistCache.get(name);
+
+    try {
+      const raw = JSON.parse(localStorage.getItem(artistStorageKey(name)) || "null");
+      if (!raw || Date.now() - (Number(raw.at) || 0) > ARTIST_CACHE_TTL) return null;
+      const tracks = Array.isArray(raw.tracks) ? raw.tracks.filter(isCachedTrack) : [];
+      if (!tracks.length) return null;
+      artistCache.set(name, tracks);
+      return tracks;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function writeArtistCache(name, tracks) {
+    artistCache.set(name, tracks);
+    try {
+      localStorage.setItem(
+        artistStorageKey(name),
+        JSON.stringify({ at: Date.now(), tracks })
+      );
+    } catch (_) {
+      /* ignore quota errors */
+    }
+  }
+
+  function artistInitials(name) {
+    const words = String(name).split(/[\s.\-–—]+/).filter(Boolean);
+    if (!words.length) return "?";
+    if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+    return `${words[0][0]}${words[1][0]}`.toUpperCase();
+  }
+
+  function artistGradient(name) {
+    let hash = 0;
+    for (const char of String(name)) {
+      hash = (hash * 31 + char.codePointAt(0)) % 360;
+    }
+    return `linear-gradient(152deg, hsl(${hash} 24% 24%), hsl(${(hash + 68) % 360} 32% 10%) 74%)`;
+  }
+
+  const artistPlayIcon =
+    '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M8 4.8 20 12 8 19.2V4.8Z" fill="currentColor"/></svg>';
+
+  function createArtistCard(artist) {
+    const card = el("button", "artist-card");
+    card.type = "button";
+    card.setAttribute("aria-label", `Открыть ${artist.name}`);
+
+    const face = el("span", "artist-card__face");
+    face.style.background = artistGradient(artist.name);
+    face.appendChild(el("span", "artist-card__initials", artistInitials(artist.name)));
+
+    const overlay = el("span", "artist-card__overlay");
+    const play = el("span", "artist-card__play");
+    play.innerHTML = artistPlayIcon;
+    overlay.appendChild(play);
+    face.appendChild(overlay);
+
+    card.append(
+      face,
+      el("span", "artist-card__name", artist.name),
+      el("span", "artist-card__meta", artist.tag || "исполнитель")
+    );
+
+    card.addEventListener("click", () => openArtist(artist));
+    return card;
+  }
+
+  function renderArtists() {
+    if (!dom.artists) return;
+    dom.artists.innerHTML = "";
+
+    if (!ARTISTS.length) {
+      dom.artists.appendChild(el("p", "artist-status", "список исполнителей пуст"));
+      return;
+    }
+
+    const fragment = document.createDocumentFragment();
+    ARTISTS.forEach((artist) => fragment.appendChild(createArtistCard(artist)));
+    dom.artists.appendChild(fragment);
+  }
+
+  let activeArtistTracks = [];
+  let artistToken = 0;
+  let artistController = null;
+
+  function shuffleList(list) {
+    const copy = [...list];
+    for (let index = copy.length - 1; index > 0; index -= 1) {
+      const random = Math.floor(Math.random() * (index + 1));
+      [copy[index], copy[random]] = [copy[random], copy[index]];
+    }
+    return copy;
+  }
+
+  function createArtistRow(track, list, index) {
+    const row = el("button", "artist-track");
+    row.type = "button";
+    row.dataset.trackId = track.id;
+    row.setAttribute("aria-label", `Включить ${track.title}`);
+
+    const cover = el("img", "artist-track__cover");
+    cover.src = track.cover || FALLBACK_COVER;
+    cover.alt = "";
+    cover.loading = "lazy";
+    guardCover(cover);
+
+    const text = el("span", "artist-track__text");
+    text.append(
+      el("span", "artist-track__name", track.title),
+      el("span", "artist-track__meta", track.artist)
+    );
+
+    const play = el("span", "artist-track__play");
+    play.innerHTML = artistPlayIcon;
+
+    row.append(
+      el("span", "artist-track__no", String(index + 1).padStart(2, "0")),
+      cover,
+      text,
+      el("span", "artist-track__dur", formatTime(track.duration)),
+      play
+    );
+
+    if (state.current && state.current.id === track.id) {
+      row.classList.add("is-current");
+    }
+
+    row.addEventListener("click", () => startQueue(list, index));
+    return row;
+  }
+
+  function paintArtistTracks(tracks) {
+    dom.artistTracks.innerHTML = "";
+
+    if (!tracks.length) {
+      dom.artistTracks.appendChild(
+        el("p", "artist-status", "подходящих треков не нашлось")
+      );
+      return;
+    }
+
+    const fragment = document.createDocumentFragment();
+    tracks.forEach((track, index) =>
+      fragment.appendChild(createArtistRow(track, tracks, index))
+    );
+    dom.artistTracks.appendChild(fragment);
+  }
+
+  function showArtistTracks(artist, tracks) {
+    activeArtistTracks = tracks;
+    const meta = [
+      artist.tag,
+      `${tracks.length} ${tracksWord(tracks.length)}`,
+    ].filter(Boolean);
+    dom.artistMeta.textContent = meta.join(" · ");
+    dom.artistPlay.disabled = false;
+    dom.artistShuffle.disabled = tracks.length < 2;
+    paintArtistTracks(tracks);
+  }
+
+  function artistError(artist) {
+    dom.artistMeta.textContent = artist.tag
+      ? `${artist.tag} · не удалось загрузить`
+      : "не удалось загрузить";
+    dom.artistTracks.innerHTML = "";
+
+    const box = el("div", "empty");
+    box.append(
+      el("strong", "", "нет соединения."),
+      document.createTextNode("источник не ответил — попробуйте ещё раз.")
+    );
+
+    const retry = el("button", "ghost-pill", "Повторить");
+    retry.type = "button";
+    retry.addEventListener("click", () => openArtist(artist, { force: true }));
+    box.appendChild(retry);
+
+    dom.artistTracks.appendChild(box);
+  }
+
+  async function openArtist(artist, { force = false } = {}) {
+    if (!artist) return;
+
+    activeArtistTracks = [];
+    artistToken += 1;
+    const token = artistToken;
+    if (artistController) artistController.abort();
+
+    setView("artist");
+    dom.artistPageTitle.textContent = artist.name;
+    dom.artistPageTitle.classList.toggle("is-long", artist.name.length > 16);
+    dom.artistMeta.textContent = artist.tag
+      ? `${artist.tag} · загружаем треки…`
+      : "загружаем треки…";
+    dom.artistPlay.disabled = true;
+    dom.artistShuffle.disabled = true;
+    dom.artistTracks.innerHTML = "";
+
+    const cached = force ? null : readArtistCache(artist.name);
+    if (cached) {
+      showArtistTracks(artist, cached);
+      return;
+    }
+
+    dom.artistTracks.appendChild(
+      el("p", "artist-status", "загружаем треки…")
+    );
+
+    const controller = new AbortController();
+    artistController = controller;
+
+    try {
+      const tracks = await fetchArtistTracks(artist, { signal: controller.signal });
+      if (token !== artistToken) return;
+
+      if (!tracks.length) {
+        dom.artistMeta.textContent = artist.tag
+          ? `${artist.tag} · ничего не найдено`
+          : "ничего не найдено";
+        paintArtistTracks([]);
+        return;
+      }
+
+      writeArtistCache(artist.name, tracks);
+      showArtistTracks(artist, tracks);
+    } catch (error) {
+      if (error.name === "AbortError" || token !== artistToken) return;
+      artistError(artist);
+    } finally {
+      if (artistController === controller) artistController = null;
+    }
+  }
+
+  dom.artistBack.addEventListener("click", () => {
+    setView("artists");
+  });
+
+  dom.artistPlay.addEventListener("click", () => {
+    if (activeArtistTracks.length) startQueue(activeArtistTracks, 0);
+  });
+
+  dom.artistShuffle.addEventListener("click", () => {
+    if (activeArtistTracks.length) {
+      startQueue(shuffleList(activeArtistTracks), 0);
     }
   });
 
@@ -1345,7 +1994,7 @@
       el(
         "p",
         "dialog__hint",
-        "Браузер не даёт плееру SoundCloud работать со страницы file://. Запустите kokky через локальный сервер — и всё заработает."
+        "Браузер не даёт плееру работать со страницы file://. Запустите kokky через локальный сервер — и всё заработает."
       )
     );
 
@@ -1471,7 +2120,7 @@
 
     const input = el("input", "dialog__input");
     input.type = "search";
-    input.placeholder = "найти трек на SoundCloud";
+    input.placeholder = "найти трек";
     input.autocomplete = "off";
     input.spellcheck = false;
     input.setAttribute("aria-label", "Поиск трека");
@@ -1533,7 +2182,7 @@
       });
     };
 
-    paint(feed.slice(0, 30), feed.length ? "тренды SoundCloud" : "начните вводить название");
+    paint(feed.slice(0, 30), feed.length ? "тренды" : "начните вводить название");
 
     let timer = 0;
     let controller = null;
@@ -1560,7 +2209,7 @@
       const query = input.value.trim();
 
       if (!query) {
-        paint(feed.slice(0, 30), feed.length ? "тренды SoundCloud" : "начните вводить название");
+        paint(feed.slice(0, 30), feed.length ? "тренды" : "начните вводить название");
         return;
       }
 
@@ -1678,7 +2327,7 @@
       const text = el("div", "pl-empty__text");
       text.append(
         el("strong", "", "пока пусто"),
-        el("p", "", "добавьте первый трек — поиск идёт по всему каталогу SoundCloud.")
+        el("p", "", "добавьте первый трек — поиск идёт по всему каталогу.")
       );
 
       const add = el("button", "ghost-pill", "Добавить трек");
@@ -1756,7 +2405,8 @@
   function setView(view) {
     if (!dom.views[view]) return;
     state.view = view;
-    const navView = view === "playlist" ? "playlists" : view;
+    const navView =
+      view === "playlist" ? "playlists" : view === "artist" ? "artists" : view;
 
     dom.navItems.forEach((item) => {
       item.classList.toggle("is-active", item.dataset.view === navView);
@@ -1780,6 +2430,19 @@
       }
     } else {
       cancelSearch();
+    }
+
+    if (view === "artists") {
+      renderArtists();
+    }
+
+    // Ушли из карточки исполнителя — отменяем незавершённую загрузку.
+    if (view !== "artist") {
+      artistToken += 1;
+      if (artistController) {
+        artistController.abort();
+        artistController = null;
+      }
     }
 
     closeMenus();
@@ -1915,15 +2578,18 @@
      Initial paint
      ========================================================= */
 
-  let feedRequested = false;
+  let feedInFlight = false;
+  let feedRefreshTimer = 0;
+  let feedRefreshQueued = false;
+  let lastFeedRefreshAt = 0;
+  const FEED_REFRESH_INTERVAL = 90000;
 
   function adoptFeed(list) {
     feed = dedupe(list);
     feedError = false;
 
     if (feed.length) {
-      const inFeed = feed.some((track) => track.id === state.current?.id);
-      if (!state.current || (!state.started && !inFeed)) {
+      if (!state.current || !state.started) {
         state.current = feed[0];
         updateTrackUI(feed[0]);
       }
@@ -1947,9 +2613,31 @@
     adoptFeed(cached.tracks);
   }
 
+  function scheduleFeedRefresh() {
+    if (feedInFlight) {
+      feedRefreshQueued = true;
+      return;
+    }
+    window.clearTimeout(feedRefreshTimer);
+    const wait = Math.max(
+      2600,
+      FEED_REFRESH_INTERVAL - (Date.now() - lastFeedRefreshAt)
+    );
+    feedRefreshTimer = window.setTimeout(() => {
+      feedRefreshTimer = 0;
+      lastFeedRefreshAt = Date.now();
+      loadFeed();
+    }, wait);
+  }
+
   async function loadFeed() {
-    if (feedRequested) return;
-    feedRequested = true;
+    if (feedInFlight) {
+      feedRefreshQueued = true;
+      return;
+    }
+    feedInFlight = true;
+    window.clearTimeout(feedRefreshTimer);
+    feedRefreshTimer = 0;
 
     try {
       const list = await fetchFeed();
@@ -1966,13 +2654,21 @@
         dom.trackTitle.textContent = "нет соединения";
         toast("не удалось загрузить тренды · проверьте соединение");
       }
+    } finally {
+      feedInFlight = false;
+      if (feedRefreshQueued) {
+        feedRefreshQueued = false;
+        scheduleFeedRefresh();
+      }
     }
   }
 
   function init() {
     renderPlaylists();
+    renderArtists();
     applyVolume();
     setupMediaSession();
+    syncWelcome();
     loadCachedFeed();
     syncPlayState();
     setView("stream");
